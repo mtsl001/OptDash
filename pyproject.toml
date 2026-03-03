@@ -10,7 +10,9 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.111.0",
     "uvicorn[standard]>=0.29.0",
-    "duckdb>=0.10.3",
+    # Upper bound <2.0: DuckDB has breaking SQL/API changes between major versions.
+    # Raise only after explicitly validating arg_max, $1 binding, and INTERVAL syntax.
+    "duckdb>=0.10.3,<2.0",
     "pydantic>=2.7.0",
     "pydantic-settings>=2.2.1",
     "apscheduler>=3.10.4",

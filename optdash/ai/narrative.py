@@ -4,23 +4,25 @@ from optdash.models import MarketSession
 
 
 def build_narrative(
-    direction:          str,
-    gate_score:         int,
-    gate_verdict:       str,
-    direction_signals:  list[dict],
-    iv_data:            dict,
-    gex_data:           dict,
-    vex_data:           dict,
-    session:            MarketSession,
-    dealer_oclock:      bool,
+    direction:         str,
+    gate_score:        int,
+    gate_verdict:      str,
+    direction_signals: list[dict],
+    iv_data:           dict,
+    gex_data:          dict,
+    vex_data:          dict,
+    session:           MarketSession,
+    dealer_oclock:     bool,
 ) -> str:
     parts = []
 
+    # Guard: skip top-signal sentence if value is None (signal unavailable)
     top_signal = max(direction_signals, key=lambda s: s["weight"], default=None)
-    if top_signal:
+    if top_signal and top_signal.get("value") is not None:
         sig  = top_signal["signal"]
         val  = top_signal["value"]
         bull = direction == "CE"
+
         if sig.startswith("VCOC"):
             parts.append(
                 f"V_CoC velocity at {val:+.1f} signals "
@@ -57,10 +59,11 @@ def build_narrative(
     pct_peak = gex_data.get("pct_of_peak")
     if pct_peak is not None and pct_peak < 70:
         parts.append(
-            f"GEX at {pct_peak:.0f}% of day peak — gamma support reduced, directional move easier."
+            f"GEX at {pct_peak:.0f}% of day peak — "
+            "gamma support reduced, directional move easier."
         )
 
     if dealer_oclock:
-        parts.append("⚠ DEALER O'CLOCK active — charm flows dominate near expiry.")
+        parts.append("⚠ DEALER O’CLOCK active — charm flows dominate near expiry.")
 
     return " ".join(parts)
