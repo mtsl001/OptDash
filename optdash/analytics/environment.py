@@ -3,11 +3,11 @@ import duckdb
 from loguru import logger
 from optdash.config import settings
 from optdash.models import GateVerdict, MarketSession
-from optdash.analytics.gex import get_net_gex, _get_gex_peak
+from optdash.analytics.gex import get_net_gex
 from optdash.analytics.coc import get_coc_latest, get_atm_obi, get_futures_obi
 from optdash.analytics.iv  import get_ivr_ivp
 from optdash.analytics.pcr import get_pcr
-from optdash.analytics.vex_cex import get_vex_cex_current   # dealer_oclock sourced from result dict
+from optdash.analytics.vex_cex import get_vex_cex_current
 
 
 def get_environment_score(
@@ -21,7 +21,7 @@ def get_environment_score(
     11-point environment gate.
     Conditions 1-8: standard (1 pt each = 8 pts max).
     Condition 9:    VEX alignment ★★ (2 pts).
-    Condition 10:   Dealer O'Clock guard ★ (1 pt).
+    Condition 10:   Dealer O’Clock guard ★ (1 pt).
     Max = 11 pts.
     """
     try:
@@ -37,10 +37,10 @@ def get_environment_score(
         vcoc      = coc_data.get("v_coc_15m", 0.0)
         fut_bs    = fut_obi
         pcr_div   = pcr_data.get("pcr_divergence", 0.0)
-        ivp       = iv_data.get("ivp", 100.0)
+        ivp       = iv_data.get("ivp")           # may be None if history unavailable
         obi       = atm_obi
         vex_total = vex_data.get("vex_total_M", 0.0)
-        dealer_oc = vex_data.get("dealer_oclock", False)  # already computed in get_vex_cex_current
+        dealer_oc = vex_data.get("dealer_oclock", False)
 
         conditions: dict[str, dict] = {}
 
@@ -58,7 +58,7 @@ def get_environment_score(
             "points": 1, "note": f"V_CoC 15m = {vcoc:+.2f}"
         }
 
-        # C3: Futures OBI bearish (1 pt)
+        # C3: Futures OBI (1 pt)
         c3_met = fut_bs < settings.FUT_OBI_BEAR_THRESHOLD
         conditions["fut_bs_ratio"] = {
             "met": c3_met, "value": round(fut_bs, 4),
@@ -73,10 +73,13 @@ def get_environment_score(
         }
 
         # C5: IV cheap (IVP < 50) (1 pt)
-        c5_met = (ivp or 100) < 50
+        # Guard: use explicit None check so IVP=0 (historically cheapest IV)
+        # is treated as valid (met=True) rather than coerced to 100 via `or`.
+        ivp_val = ivp if ivp is not None else 100.0
+        c5_met  = ivp_val < 50
         conditions["ivp_cheap"] = {
-            "met": c5_met, "value": round(ivp or 100, 1),
-            "points": 1, "note": f"IVP = {ivp:.0f}th pct"
+            "met": c5_met, "value": round(ivp_val, 1),
+            "points": 1, "note": f"IVP = {ivp_val:.0f}th pct"
         }
 
         # C6: ATM OBI significant (1 pt)
@@ -115,22 +118,22 @@ def get_environment_score(
             "points": 2, "note": "VEX mechanical alignment ★★ (2 pts)"
         }
 
-        # C10: Not Dealer O'Clock on DTE=1 ★ (1 pt bonus if safe)
+        # C10: Not Dealer O’Clock on DTE=1 ★ (1 pt bonus if safe)
         c10_met = not dealer_oc
         conditions["not_charm_distortion"] = {
             "met": c10_met,
             "value": "SAFE" if c10_met else "DEALER_OCLOCK",
             "points": 1,
-            "note": "Dealer O'Clock guard ★"
+            "note": "Dealer O’Clock guard ★"
         }
 
         score   = min(
             sum(c["points"] for c in conditions.values() if c["met"]),
-            settings.GATE_MAX_SCORE
+            settings.GATE_MAX_SCORE,
         )
         verdict = (
-            GateVerdict.GO.value    if score >= settings.GATE_GO_THRESHOLD   else
-            GateVerdict.WAIT.value  if score >= settings.GATE_WAIT_THRESHOLD  else
+            GateVerdict.GO.value   if score >= settings.GATE_GO_THRESHOLD   else
+            GateVerdict.WAIT.value if score >= settings.GATE_WAIT_THRESHOLD  else
             GateVerdict.NO_GO.value
         )
 

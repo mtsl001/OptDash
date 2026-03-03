@@ -36,13 +36,17 @@ def track_open_positions(
         theta = current["theta"]
         vega  = current["vega"]
 
-        entry_premium = trade["entry_premium"]
-        pnl_abs = round(ltp - entry_premium, 2)
-        pnl_pct = round((pnl_abs / entry_premium) * 100, 2)
+        # Use actual_entry_price (slippage-adjusted fill) if the trader
+        # recorded one on ACCEPT. Falls back to recommended entry_premium.
+        # This matches eod.py and ensures all PnL/trailing-stop math is
+        # based on what the trader actually paid, not what was recommended.
+        entry   = trade["actual_entry_price"] or trade["entry_premium"]
+        pnl_abs = round(ltp - entry, 2)
+        pnl_pct = round((pnl_abs / entry) * 100, 2) if entry else 0.0
 
         # Theta SL
         t_elapsed   = _minutes_since_entry(trade["snap_time"], snap_time)
-        sl_adjusted = compute_theta_sl(entry_premium, trade["theta"] or 0, t_elapsed)
+        sl_adjusted = compute_theta_sl(entry, trade["theta"] or 0, t_elapsed)
 
         theta_sl_status = (
             "STOP_HIT"                 if ltp < sl_adjusted else
@@ -61,27 +65,35 @@ def track_open_positions(
         # IV crush
         iv_change = iv - (trade["iv_at_entry"] or iv)
         iv_crush = (
-            IVCrushSeverity.HIGH.value if iv_change < -3.0 and abs(vega or 0) > settings.IV_CRUSH_HIGH_VEGA
+            IVCrushSeverity.HIGH.value
+            if iv_change < -3.0 and abs(vega or 0) > settings.IV_CRUSH_HIGH_VEGA
             else IVCrushSeverity.LOW.value  if iv_change < -1.0
             else IVCrushSeverity.NONE.value
         )
 
         # Gate check
-        gate = get_environment_score(conn, trade_date, snap_time, underlying,
-                                      direction=opt_type)
+        gate       = get_environment_score(
+            conn, trade_date, snap_time, underlying, direction=opt_type
+        )
         gate_no_go = gate["verdict"] == "NO_GO"
 
         # PnL attribution
         pnl_attr = compute_pnl_attribution(
             entry={
-                "spot": trade["spot_at_entry"], "iv": trade["iv_at_entry"],
-                "delta": trade["delta"],        "gamma": trade["gamma"],
-                "vega":  trade["vega"],          "theta": trade["theta"],
-                "premium": entry_premium,        "snap_time": trade["snap_time"],
+                "spot":      trade["spot_at_entry"],
+                "iv":        trade["iv_at_entry"],
+                "delta":     trade["delta"],
+                "gamma":     trade["gamma"],
+                "vega":      trade["vega"],
+                "theta":     trade["theta"],
+                "premium":   entry,               # use actual entry price
+                "snap_time": trade["snap_time"],
             },
             current={
-                "spot": current.get("spot"), "iv": iv,
-                "ltp":  ltp, "snap_time": snap_time,
+                "spot":      current.get("spot"),
+                "iv":        iv,
+                "ltp":       ltp,
+                "snap_time": snap_time,
             },
         )
 
@@ -108,12 +120,16 @@ def track_open_positions(
         # Auto-close logic
         exit_reason = None
         if ltp <= trail_sl:
-            exit_reason = (ExitReason.THETA_SL_HIT.value
-                           if theta_sl_status == "STOP_HIT"
-                           else ExitReason.SL_HIT.value)
+            exit_reason = (
+                ExitReason.THETA_SL_HIT.value
+                if theta_sl_status == "STOP_HIT"
+                else ExitReason.SL_HIT.value
+            )
         elif ltp >= trade["target_price"]:
             exit_reason = ExitReason.TARGET_HIT.value
-        elif gate_no_go and _consecutive_no_go_count(jconn, trade["id"]) >= settings.GATE_SUSTAINED_NO_GO_SNAPS:
+        elif gate_no_go and _consecutive_no_go_count(
+            jconn, trade["id"]
+        ) >= settings.GATE_SUSTAINED_NO_GO_SNAPS:
             exit_reason = ExitReason.GATE_NO_GO.value
         elif iv_crush == IVCrushSeverity.HIGH.value and pnl_pct < -15:
             exit_reason = ExitReason.IV_CRUSH.value
@@ -132,8 +148,11 @@ def track_open_positions(
             )
 
 
-def expire_stale_recommendations(jconn: sqlite3.Connection,
-                                  trade_date: str, snap_time: str) -> None:
+def expire_stale_recommendations(
+    jconn:      sqlite3.Connection,
+    trade_date: str,
+    snap_time:  str,
+) -> None:
     """Mark GENERATED trades as EXPIRED after AI_EXPIRY_MAX_SNAPS unactioned."""
     pending = trades.get_pending_trades(jconn)
     for trade in pending:
@@ -159,7 +178,7 @@ def _fetch_strike_current(
                strike_price, expiry, option_type]).fetchone()
         if not row:
             return None
-        return dict(zip(["ltp","iv","delta","theta","gamma","vega","spot"], row))
+        return dict(zip(["ltp", "iv", "delta", "theta", "gamma", "vega", "spot"], row))
     except Exception as e:
         logger.warning("_fetch_strike_current error: {}", e)
         return None
