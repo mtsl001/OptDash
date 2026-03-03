@@ -10,14 +10,14 @@ from optdash.models import Direction, TradeStatus
 from optdash.analytics.environment import get_environment_score, get_market_session
 from optdash.analytics.gex import get_net_gex, get_max_pain
 from optdash.analytics.iv import get_ivr_ivp
-from optdash.analytics.vex_cex import get_vex_cex_current   # dealer_oclock in result
+from optdash.analytics.vex_cex import get_vex_cex_current
 from optdash.analytics.screener import get_strikes
 from optdash.ai.direction import get_directional_bias
 from optdash.ai.confidence import compute_confidence
 from optdash.ai.narrative import build_narrative
 from optdash.ai.pre_flight import run_pre_flight
 from optdash.ai.quality import compute_quality_score
-from optdash.ai.journal import trades             # shadow removed — not used here
+from optdash.ai.journal import trades
 from optdash.ai.learning import stats
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -52,7 +52,6 @@ def generate_recommendation(
     gex_data  = get_net_gex(conn, trade_date, snap_time, underlying)
     vex_data  = get_vex_cex_current(conn, trade_date, snap_time, underlying)
 
-    # dealer_oclock is already computed inside get_vex_cex_current — no extra call needed
     dealer_oc = vex_data.get("dealer_oclock", False)
 
     nearest_expiry = _nearest_expiry(conn, trade_date, snap_time, underlying)
@@ -75,7 +74,7 @@ def generate_recommendation(
         return None
     strike = candidates[0]
 
-    # ── Learning context (historical win-rate for this session/direction) ──────────
+    # ── Learning context (session + direction specific win-rate) ───────────────
     learning = stats.get_session_stats(
         jconn, underlying=underlying, direction=direction, session=session
     )
@@ -149,6 +148,7 @@ def generate_recommendation(
         "direction_signals": json.dumps(dir_res["signals"]),
         "narrative":         narrative,
         "status":            TradeStatus.GENERATED.value,
+        "session":           session.value,          # stored for learning stats
         "delta":             strike.get("delta"),
         "theta":             strike.get("theta"),
         "vega":              strike.get("vega"),
@@ -160,9 +160,9 @@ def generate_recommendation(
     })
 
     logger.info(
-        "Recommendation: {} {} {} @ {:.1f} | conf={}% gate={}",
+        "Recommendation: {} {} {} @ {:.1f} | conf={}% gate={} session={}",
         underlying, direction, strike["strike_price"],
-        entry_premium, confidence, gate["score"]
+        entry_premium, confidence, gate["score"], session.value
     )
     return trades.get_trade(jconn, trade_id)
 

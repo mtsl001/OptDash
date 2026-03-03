@@ -2,20 +2,23 @@
 import sqlite3
 from optdash.models import MarketSession
 
+# Whitelist for get_threshold_performance to prevent SQL injection
+_ALLOWED_THRESHOLD_FIELDS = {"confidence", "gate_score", "s_score"}
+
 
 def get_session_stats(
     conn:       sqlite3.Connection,
-    underlying: str | None  = None,
-    direction:  str | None  = None,
+    underlying: str | None          = None,
+    direction:  str | None          = None,
     session:    MarketSession | None = None,
     min_trades: int = 10,
 ) -> dict:
     """
     Returns win_rate, avg_pnl, total_trades for the given filter bucket.
-    Falls back to overall stats if bucket has < min_trades.
+    Falls back to overall stats if the bucket has fewer than min_trades closed trades.
     """
     base_where = ["status='CLOSED'", "final_pnl_pct IS NOT NULL"]
-    params = []
+    params: list = []
 
     if underlying:
         base_where.append("underlying=?")
@@ -23,63 +26,78 @@ def get_session_stats(
     if direction:
         base_where.append("option_type=?")
         params.append(direction)
+    if session:
+        base_where.append("session=?")
+        params.append(session.value)
 
     where = " AND ".join(base_where)
     row = conn.execute(
         f"""SELECT
-            COUNT(*)                                   AS total,
-            SUM(CASE WHEN final_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins,
-            AVG(final_pnl_pct)                         AS avg_pnl,
-            AVG(confidence)                            AS avg_conf,
-            AVG(gate_score)                            AS avg_gate
-           FROM trades WHERE {where}""",
+                COUNT(*)                                              AS total,
+                SUM(CASE WHEN final_pnl_pct > 0 THEN 1 ELSE 0 END)  AS wins,
+                AVG(final_pnl_pct)                                    AS avg_pnl,
+                AVG(confidence)                                       AS avg_conf,
+                AVG(gate_score)                                       AS avg_gate
+            FROM trades WHERE {where}""",
         params
     ).fetchone()
 
     total = row[0] or 0
     if total < min_trades:
-        # Fallback to global stats
+        # Fallback: global stats — not enough history in this specific bucket
         row = conn.execute(
             """SELECT COUNT(*),
-                SUM(CASE WHEN final_pnl_pct > 0 THEN 1 ELSE 0 END),
-                AVG(final_pnl_pct), AVG(confidence), AVG(gate_score)
-               FROM trades WHERE status='CLOSED' AND final_pnl_pct IS NOT NULL"""
+                      SUM(CASE WHEN final_pnl_pct > 0 THEN 1 ELSE 0 END),
+                      AVG(final_pnl_pct), AVG(confidence), AVG(gate_score)
+               FROM trades
+               WHERE status='CLOSED' AND final_pnl_pct IS NOT NULL"""
         ).fetchone()
         total = row[0] or 0
 
-    wins    = row[1] or 0
-    avg_pnl = round(float(row[2] or 0), 2)
-    avg_conf= round(float(row[3] or 0), 1)
-    avg_gate= round(float(row[4] or 0), 1)
-    win_rate= round((wins / total * 100) if total else 50.0, 1)
+    wins     = row[1] or 0
+    avg_pnl  = round(float(row[2] or 0), 2)
+    avg_conf = round(float(row[3] or 0), 1)
+    avg_gate = round(float(row[4] or 0), 1)
+    win_rate = round((wins / total * 100) if total else 50.0, 1)
 
     return {
-        "win_rate":    win_rate,
-        "avg_pnl":     avg_pnl,
-        "total_trades":total,
+        "win_rate":       win_rate,
+        "avg_pnl":        avg_pnl,
+        "total_trades":   total,
         "avg_confidence": avg_conf,
-        "avg_gate":    avg_gate,
+        "avg_gate":       avg_gate,
     }
 
 
 def get_threshold_performance(
-    conn:       sqlite3.Connection,
-    threshold_field: str,  # 'confidence' | 'gate_score' | 's_score'
-    buckets: list[tuple[float, float]] | None = None,
+    conn:            sqlite3.Connection,
+    threshold_field: str,
+    buckets:         list[tuple[float, float]] | None = None,
 ) -> list[dict]:
-    """Win rate by threshold bucket — for the learning report."""
+    """Win rate by threshold bucket — for the learning report.
+
+    threshold_field must be one of: 'confidence', 'gate_score', 's_score'.
+    Raises ValueError on any other value to prevent SQL injection.
+    """
+    if threshold_field not in _ALLOWED_THRESHOLD_FIELDS:
+        raise ValueError(
+            f"Invalid threshold_field {threshold_field!r}. "
+            f"Allowed: {sorted(_ALLOWED_THRESHOLD_FIELDS)}"
+        )
+
     if buckets is None:
         buckets = [(0, 50), (50, 65), (65, 75), (75, 85), (85, 101)]
 
     results = []
     for lo, hi in buckets:
         row = conn.execute(
-            f"""SELECT COUNT(*),
-                SUM(CASE WHEN final_pnl_pct > 0 THEN 1 ELSE 0 END),
-                AVG(final_pnl_pct)
-               FROM trades
-               WHERE status='CLOSED' AND final_pnl_pct IS NOT NULL
-                 AND {threshold_field} >= ? AND {threshold_field} < ?""",
+            f"""SELECT
+                    COUNT(*),
+                    SUM(CASE WHEN final_pnl_pct > 0 THEN 1 ELSE 0 END),
+                    AVG(final_pnl_pct)
+                FROM trades
+                WHERE status='CLOSED' AND final_pnl_pct IS NOT NULL
+                  AND {threshold_field} >= ? AND {threshold_field} < ?""",
             [lo, hi]
         ).fetchone()
         total = row[0] or 0

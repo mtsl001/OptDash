@@ -5,8 +5,12 @@ from optdash.config import settings
 from optdash.models import TermStructureShape
 
 
-def get_ivr_ivp(conn: duckdb.DuckDBPyConnection, trade_date: str,
-                snap_time: str, underlying: str) -> dict:
+def get_ivr_ivp(
+    conn:       duckdb.DuckDBPyConnection,
+    trade_date: str,
+    snap_time:  str,
+    underlying: str,
+) -> dict:
     """IVR and IVP for ATM TIER1 options."""
     try:
         # Current ATM IV
@@ -20,53 +24,65 @@ def get_ivr_ivp(conn: duckdb.DuckDBPyConnection, trade_date: str,
             WHERE o.trade_date=? AND o.snap_time=? AND o.underlying=?
               AND o.expiry_tier='TIER1'
               AND ABS(o.strike_price - s.spot) = (
-                  SELECT MIN(ABS(strike_price - s.spot)) FROM options_data
-                  WHERE trade_date=? AND snap_time=? AND underlying=? AND expiry_tier='TIER1'
+                  SELECT MIN(ABS(strike_price - s.spot))
+                  FROM options_data
+                  WHERE trade_date=? AND snap_time=? AND underlying=?
+                    AND expiry_tier='TIER1'
               )
-        """, [trade_date, snap_time, underlying,
-               trade_date, snap_time, underlying,
-               trade_date, snap_time, underlying]).fetchone()
+        """, [
+            trade_date, snap_time, underlying,
+            trade_date, snap_time, underlying,
+            trade_date, snap_time, underlying,
+        ]).fetchone()
         atm_iv = cur[0] if cur else None
         if not atm_iv:
             return {}
 
-        # Historical IV stats (lookback)
+        # Historical IV stats (lookback window)
         hist = conn.execute("""
-            SELECT MIN(daily_atm_iv) AS iv_low, MAX(daily_atm_iv) AS iv_high,
-                   PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY daily_atm_iv) AS iv_median
+            SELECT
+                MIN(daily_atm_iv) AS iv_low,
+                MAX(daily_atm_iv) AS iv_high,
+                PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY daily_atm_iv) AS iv_median
             FROM (
                 SELECT trade_date, AVG(iv) AS daily_atm_iv
                 FROM options_data
                 WHERE underlying=? AND expiry_tier='TIER1'
-                  AND trade_date < ? AND trade_date >= (date(?) - INTERVAL ? DAY)
+                  AND trade_date < ?
+                  AND trade_date >= (date(?) - INTERVAL ? DAY)
                 GROUP BY trade_date
             )
         """, [underlying, trade_date, trade_date, settings.IV_LOOKBACK_DAYS]).fetchone()
 
-        iv_low  = hist[0] if hist and hist[0] else atm_iv * 0.5
-        iv_high = hist[1] if hist and hist[1] else atm_iv * 1.5
+        iv_low    = hist[0] if hist and hist[0] else atm_iv * 0.5
+        iv_high   = hist[1] if hist and hist[1] else atm_iv * 1.5
         iv_median = hist[2] if hist and hist[2] else atm_iv
 
-        ivr = round((atm_iv - iv_low) / (iv_high - iv_low) * 100, 1) if iv_high > iv_low else 50.0
+        ivr = (
+            round((atm_iv - iv_low) / (iv_high - iv_low) * 100, 1)
+            if iv_high > iv_low else 50.0
+        )
 
-        # IVP: percentile of current IV vs historical distribution
+        # IVP: percentile rank of current IV vs historical daily distribution.
+        # Single CTE scan instead of two identical subqueries.
         pct_row = conn.execute("""
-            SELECT COUNT(*) AS below, (SELECT COUNT(*) FROM (
+            WITH daily_ivs AS (
                 SELECT trade_date, AVG(iv) AS d
-                FROM options_data WHERE underlying=? AND expiry_tier='TIER1'
-                  AND trade_date < ? GROUP BY trade_date
-            )) AS total
-            FROM (
-                SELECT trade_date, AVG(iv) AS d
-                FROM options_data WHERE underlying=? AND expiry_tier='TIER1'
-                  AND trade_date < ? GROUP BY trade_date
-            ) WHERE d <= ?
-        """, [underlying, trade_date, underlying, trade_date, atm_iv]).fetchone()
+                FROM options_data
+                WHERE underlying=? AND expiry_tier='TIER1'
+                  AND trade_date < ?
+                GROUP BY trade_date
+            )
+            SELECT
+                SUM(CASE WHEN d <= ? THEN 1 ELSE 0 END) AS below,
+                COUNT(*) AS total
+            FROM daily_ivs
+        """, [underlying, trade_date, atm_iv]).fetchone()
 
         total = pct_row[1] if pct_row and pct_row[1] else 1
         ivp   = round(pct_row[0] / total * 100, 1) if total else 50.0
 
-        # HV20 — 20-day historical vol
+        # HV20 — 20-day realised volatility
         hv20_row = conn.execute("""
             SELECT STDDEV(daily_ret) * SQRT(252) * 100 AS hv20
             FROM (
@@ -74,25 +90,37 @@ def get_ivr_ivp(conn: duckdb.DuckDBPyConnection, trade_date: str,
                        LN(MAX(spot) / LAG(MAX(spot)) OVER (ORDER BY trade_date)) AS daily_ret
                 FROM options_data
                 WHERE underlying=? AND trade_date <= ?
-                GROUP BY trade_date ORDER BY trade_date DESC LIMIT 22
+                GROUP BY trade_date
+                ORDER BY trade_date DESC
+                LIMIT 22
             )
         """, [underlying, trade_date]).fetchone()
         hv20 = round(hv20_row[0], 1) if hv20_row and hv20_row[0] else None
 
         return {
-            "atm_iv": round(atm_iv, 2), "ivr": ivr, "ivp": ivp,
-            "iv_low": round(iv_low, 2), "iv_high": round(iv_high, 2),
-            "iv_median": round(iv_median, 2), "hv20": hv20,
+            "atm_iv":       round(atm_iv, 2),
+            "ivr":          ivr,
+            "ivp":          ivp,
+            "iv_low":       round(iv_low, 2),
+            "iv_high":      round(iv_high, 2),
+            "iv_median":    round(iv_median, 2),
+            "hv20":         hv20,
             "iv_hv_spread": round(atm_iv - (hv20 or atm_iv), 2),
-            "shape": get_term_structure(conn, trade_date, snap_time, underlying).get("shape", "FLAT"),
+            "shape":        get_term_structure(
+                                conn, trade_date, snap_time, underlying
+                            ).get("shape", "FLAT"),
         }
     except Exception as e:
         logger.warning("get_ivr_ivp error: {}", e)
         return {}
 
 
-def get_term_structure(conn: duckdb.DuckDBPyConnection, trade_date: str,
-                       snap_time: str, underlying: str) -> dict:
+def get_term_structure(
+    conn:       duckdb.DuckDBPyConnection,
+    trade_date: str,
+    snap_time:  str,
+    underlying: str,
+) -> dict:
     """ATM IV per expiry tier with shape classification."""
     try:
         rows = conn.execute("""
@@ -103,23 +131,26 @@ def get_term_structure(conn: duckdb.DuckDBPyConnection, trade_date: str,
             SELECT
                 o.expiry_date,
                 o.expiry_tier,
-                MIN(o.dte)                         AS dte,
-                AVG(o.iv)                          AS atm_iv,
-                AVG(o.theta)                       AS avg_theta
+                MIN(o.dte)      AS dte,
+                AVG(o.iv)       AS atm_iv,
+                AVG(o.theta)    AS avg_theta
             FROM options_data o, spot_cte s
             WHERE o.trade_date=? AND o.snap_time=? AND o.underlying=?
               AND ABS(o.strike_price - s.spot) <= s.spot * 0.015
             GROUP BY o.expiry_date, o.expiry_tier
             ORDER BY dte
-        """, [trade_date, snap_time, underlying,
-               trade_date, snap_time, underlying]).fetchall()
+        """, [
+            trade_date, snap_time, underlying,
+            trade_date, snap_time, underlying,
+        ]).fetchall()
         if not rows:
             return {"series": [], "shape": "FLAT", "near_iv": None, "far_iv": None}
         series = [{
             "expiry_date": r[0], "expiry_tier": r[1], "dte": r[2],
-            "atm_iv": round(r[3] or 0, 2), "avg_theta": round(r[4] or 0, 4),
+            "atm_iv":      round(r[3] or 0, 2),
+            "avg_theta":   round(r[4] or 0, 4),
         } for r in rows]
-        near_iv = series[0]["atm_iv"] if series else None
+        near_iv = series[0]["atm_iv"]  if series          else None
         far_iv  = series[-1]["atm_iv"] if len(series) > 1 else near_iv
         shape   = _classify_shape(near_iv, far_iv)
         return {"series": series, "shape": shape, "near_iv": near_iv, "far_iv": far_iv}

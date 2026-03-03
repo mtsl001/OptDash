@@ -2,6 +2,9 @@
 
 All tables use CREATE TABLE IF NOT EXISTS so init_db() is safely idempotent
 and can be called on every fresh connection without side effects.
+
+For existing databases, _run_migrations() uses ALTER TABLE to add new columns;
+SQLite silently raises OperationalError on duplicate columns which we catch.
 """
 
 CREATE_TRADES = """
@@ -15,7 +18,7 @@ CREATE TABLE IF NOT EXISTS trades (
     expiry_date         TEXT    NOT NULL,
     dte                 INTEGER,
     entry_premium       REAL    NOT NULL,
-    actual_entry_price  REAL,               -- set on ACCEPT
+    actual_entry_price  REAL,               -- set on ACCEPT (slippage-adjusted)
     sl_price            REAL    NOT NULL,
     target_price        REAL    NOT NULL,
     exit_premium        REAL,
@@ -33,6 +36,7 @@ CREATE TABLE IF NOT EXISTS trades (
     status              TEXT    NOT NULL DEFAULT 'GENERATED',
     rejection_reason    TEXT,
     rejection_note      TEXT,
+    session             TEXT,               -- MarketSession enum value
     delta               REAL,
     theta               REAL,
     vega                REAL,
@@ -104,17 +108,24 @@ CREATE INDEX IF NOT EXISTS idx_trades_status          ON trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_date            ON trades(trade_date);
 CREATE INDEX IF NOT EXISTS idx_trades_underlying      ON trades(underlying);
 CREATE INDEX IF NOT EXISTS idx_trades_status_ul       ON trades(status, underlying);
+CREATE INDEX IF NOT EXISTS idx_trades_session         ON trades(session);
 CREATE INDEX IF NOT EXISTS idx_snaps_trade            ON position_snaps(trade_id);
 CREATE INDEX IF NOT EXISTS idx_shadow_trade_id        ON shadow_trades(trade_id);
 CREATE INDEX IF NOT EXISTS idx_shadow_date            ON shadow_trades(trade_date);
 CREATE INDEX IF NOT EXISTS idx_shadow_snaps_shadow_id ON shadow_snaps(shadow_id);
 """
 
+# Additive-only migrations for existing databases.
+# SQLite raises OperationalError: "duplicate column name" on re-runs; we catch it.
+_MIGRATIONS = [
+    "ALTER TABLE trades ADD COLUMN session TEXT",
+]
+
 
 def init_db(conn) -> None:
-    """Create all tables and indexes. Idempotent — safe to call on every new connection."""
-    # Enable FK enforcement on this connection before creating tables.
-    # Must be set per-connection in SQLite.
+    """Create all tables and indexes, then apply any pending column migrations.
+    Idempotent — safe to call on every new connection.
+    """
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(
         CREATE_TRADES
@@ -124,3 +135,16 @@ def init_db(conn) -> None:
         + CREATE_INDEXES
     )
     conn.commit()
+    _run_migrations(conn)
+
+
+def _run_migrations(conn) -> None:
+    """Apply ALTER TABLE migrations for existing databases.
+    Each migration is run once; duplicate-column errors are silently ignored.
+    """
+    for sql in _MIGRATIONS:
+        try:
+            conn.execute(sql)
+            conn.commit()
+        except Exception:
+            pass  # Column already exists — expected on re-runs
