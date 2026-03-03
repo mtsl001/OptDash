@@ -1,7 +1,7 @@
 """Market data endpoints — spot, GEX, CoC, environment gate."""
 from fastapi import APIRouter, Depends, Query
 from optdash.api.deps import get_duck
-from optdash.analytics.gex import get_net_gex, get_gex_series
+from optdash.analytics.gex import get_net_gex, get_gex_series, get_spot_summary
 from optdash.analytics.coc import get_coc_latest, get_coc_series
 from optdash.analytics.environment import get_environment_score
 
@@ -12,25 +12,19 @@ DEFAULT_UNDERLYING = "NIFTY"
 
 @router.get("/spot")
 def spot(
-    trade_date: str  = Query(...),
-    underlying: str  = Query(DEFAULT_UNDERLYING),
+    trade_date: str = Query(...),
+    underlying: str = Query(DEFAULT_UNDERLYING),
     duck = Depends(get_duck),
 ):
-    row = duck.execute(
-        """
-        SELECT snap_time, spot, day_open, day_high, day_low,
-               (spot - day_open) / NULLIF(day_open, 0) * 100 AS change_pct
-        FROM options_data
-        WHERE trade_date=? AND underlying=?
-        ORDER BY snap_time DESC LIMIT 1
-        """,
-        [trade_date, underlying]
-    ).fetchone()
-    if not row:
+    """
+    Returns current spot with full-day OHLC and change_pct.
+    Uses get_spot_summary() (arg_max/arg_min) to ensure spot = latest snap,
+    day_open = first snap, day_high/low = true intraday range.
+    """
+    result = get_spot_summary(duck, trade_date, underlying)
+    if not result:
         return {"error": "no data"}
-    return dict(zip(
-        ["snap_time","spot","day_open","day_high","day_low","change_pct"], row
-    ))
+    return result
 
 
 @router.get("/gex")
@@ -73,10 +67,10 @@ def coc_current(
 
 @router.get("/environment")
 def environment(
-    trade_date: str         = Query(...),
-    snap_time:  str         = Query(...),
-    underlying: str         = Query(DEFAULT_UNDERLYING),
-    direction:  str | None  = Query(None),
+    trade_date: str        = Query(...),
+    snap_time:  str        = Query(...),
+    underlying: str        = Query(DEFAULT_UNDERLYING),
+    direction:  str | None = Query(None),
     duck = Depends(get_duck),
 ):
     return get_environment_score(duck, trade_date, snap_time, underlying, direction)

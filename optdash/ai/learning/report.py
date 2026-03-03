@@ -10,42 +10,73 @@ def build_learning_report(conn: sqlite3.Connection, days: int = 30) -> dict:
     - Overall performance
     - By underlying
     - By direction (CE/PE)
+    - By session
     - Threshold analysis (confidence, gate_score, s_score)
-    - Shadow trade comparison (what would have happened if we accepted)
+    - Shadow trade comparison
     - Rejection reason analysis
     """
     overall = get_session_stats(conn)
 
     # By underlying
     underlyings_rows = conn.execute(
-        """SELECT underlying, COUNT(*),
-               SUM(CASE WHEN final_pnl_pct>0 THEN 1 ELSE 0 END),
-               AVG(final_pnl_pct)
-           FROM trades WHERE status='CLOSED' AND final_pnl_pct IS NOT NULL
+        """SELECT underlying,
+                  COUNT(*),
+                  SUM(CASE WHEN final_pnl_pct > 0 THEN 1 ELSE 0 END),
+                  AVG(final_pnl_pct)
+           FROM trades
+           WHERE status='CLOSED' AND final_pnl_pct IS NOT NULL
            GROUP BY underlying"""
     ).fetchall()
     by_underlying = [
-        {"underlying": r[0],
-         "total": r[1],
-         "win_rate": round(r[2] / r[1] * 100, 1) if r[1] else None,
-         "avg_pnl": round(r[3], 2)}
+        {
+            "underlying": r[0],
+            "total":      r[1],
+            # Guard: SUM(CASE...) returns NULL when zero rows match CASE — not 0
+            "win_rate":   round((r[2] or 0) / r[1] * 100, 1) if r[1] else None,
+            "avg_pnl":    round(r[3] or 0, 2),
+        }
         for r in underlyings_rows
     ]
 
     # By direction
     direction_rows = conn.execute(
-        """SELECT option_type, COUNT(*),
-               SUM(CASE WHEN final_pnl_pct>0 THEN 1 ELSE 0 END),
-               AVG(final_pnl_pct)
-           FROM trades WHERE status='CLOSED' AND final_pnl_pct IS NOT NULL
+        """SELECT option_type,
+                  COUNT(*),
+                  SUM(CASE WHEN final_pnl_pct > 0 THEN 1 ELSE 0 END),
+                  AVG(final_pnl_pct)
+           FROM trades
+           WHERE status='CLOSED' AND final_pnl_pct IS NOT NULL
            GROUP BY option_type"""
     ).fetchall()
     by_direction = [
-        {"direction": r[0],
-         "total":     r[1],
-         "win_rate":  round(r[2] / r[1] * 100, 1) if r[1] else None,
-         "avg_pnl":   round(r[3], 2)}
+        {
+            "direction": r[0],
+            "total":     r[1],
+            "win_rate":  round((r[2] or 0) / r[1] * 100, 1) if r[1] else None,
+            "avg_pnl":   round(r[3] or 0, 2),
+        }
         for r in direction_rows
+    ]
+
+    # By session
+    session_rows = conn.execute(
+        """SELECT session,
+                  COUNT(*),
+                  SUM(CASE WHEN final_pnl_pct > 0 THEN 1 ELSE 0 END),
+                  AVG(final_pnl_pct)
+           FROM trades
+           WHERE status='CLOSED' AND final_pnl_pct IS NOT NULL
+             AND session IS NOT NULL
+           GROUP BY session"""
+    ).fetchall()
+    by_session = [
+        {
+            "session":  r[0],
+            "total":    r[1],
+            "win_rate": round((r[2] or 0) / r[1] * 100, 1) if r[1] else None,
+            "avg_pnl":  round(r[3] or 0, 2),
+        }
+        for r in session_rows
     ]
 
     # By exit reason
@@ -61,16 +92,19 @@ def build_learning_report(conn: sqlite3.Connection, days: int = 30) -> dict:
 
     # Threshold analysis
     confidence_buckets = get_threshold_performance(conn, "confidence")
-    gate_buckets       = get_threshold_performance(conn, "gate_score",
-                         [(0,5),(5,7),(7,8),(8,9),(9,12)])
-    sscore_buckets     = get_threshold_performance(conn, "s_score",
-                         [(0,8),(8,12),(12,16),(16,100)])
+    gate_buckets       = get_threshold_performance(
+        conn, "gate_score", [(0, 5), (5, 7), (7, 8), (8, 9), (9, 12)]
+    )
+    sscore_buckets     = get_threshold_performance(
+        conn, "s_score", [(0, 8), (8, 12), (12, 16), (16, 100)]
+    )
 
     # Rejection reason breakdown
     reject_rows = conn.execute(
         """SELECT rejection_reason, COUNT(*)
            FROM trades WHERE status='REJECTED'
-           GROUP BY rejection_reason ORDER BY COUNT(*) DESC"""
+           GROUP BY rejection_reason
+           ORDER BY COUNT(*) DESC"""
     ).fetchall()
     rejection_analysis = [{"reason": r[0], "count": r[1]} for r in reject_rows]
 
@@ -78,28 +112,30 @@ def build_learning_report(conn: sqlite3.Connection, days: int = 30) -> dict:
     shadows        = get_shadow_history(conn, days=days)
     shadow_wins    = sum(1 for s in shadows if (s.get("final_pnl_pct") or 0) > 0)
     shadow_total   = len(shadows)
-    shadow_avg_pnl = round(
-        sum(s.get("final_pnl_pct") or 0 for s in shadows) / shadow_total, 2
-    ) if shadow_total else 0
-    shadow_outcomes = {}
+    shadow_avg_pnl = (
+        round(sum(s.get("final_pnl_pct") or 0 for s in shadows) / shadow_total, 2)
+        if shadow_total else 0
+    )
+    shadow_outcomes: dict[str, int] = {}
     for s in shadows:
         o = s.get("outcome", "UNKNOWN")
         shadow_outcomes[o] = shadow_outcomes.get(o, 0) + 1
 
     return {
-        "overall":              overall,
-        "by_underlying":        by_underlying,
-        "by_direction":         by_direction,
-        "by_exit_reason":       by_exit,
-        "confidence_buckets":   confidence_buckets,
-        "gate_buckets":         gate_buckets,
-        "sscore_buckets":       sscore_buckets,
-        "rejection_analysis":   rejection_analysis,
+        "overall":            overall,
+        "by_underlying":      by_underlying,
+        "by_direction":       by_direction,
+        "by_session":         by_session,
+        "by_exit_reason":     by_exit,
+        "confidence_buckets": confidence_buckets,
+        "gate_buckets":       gate_buckets,
+        "sscore_buckets":     sscore_buckets,
+        "rejection_analysis": rejection_analysis,
         "shadow_summary": {
-            "total":     shadow_total,
-            "wins":      shadow_wins,
-            "win_rate":  round(shadow_wins / shadow_total * 100, 1) if shadow_total else None,
-            "avg_pnl":   shadow_avg_pnl,
-            "outcomes":  shadow_outcomes,
+            "total":    shadow_total,
+            "wins":     shadow_wins,
+            "win_rate": round(shadow_wins / shadow_total * 100, 1) if shadow_total else None,
+            "avg_pnl":  shadow_avg_pnl,
+            "outcomes": shadow_outcomes,
         },
     }
