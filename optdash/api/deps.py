@@ -15,8 +15,16 @@ async def startup(app: FastAPI) -> None:
 
     logger.info("Connecting SQLite journal: {}", settings.JOURNAL_DB_PATH)
     jconn = sqlite3.connect(str(settings.JOURNAL_DB_PATH), check_same_thread=False)
-    jconn.row_factory = sqlite3.Row
-    init_db(jconn)
+    jconn.row_factory  = sqlite3.Row
+
+    # WAL mode: allows concurrent reads+writes without exclusive locking.
+    # The scheduler writes position_snaps every 5 min while the API handles
+    # accept/reject requests — both need simultaneous write access.
+    jconn.execute("PRAGMA journal_mode=WAL")
+    jconn.execute("PRAGMA synchronous=NORMAL")   # safe with WAL, ~3x faster writes
+    jconn.execute("PRAGMA foreign_keys=ON")       # enforce referential integrity
+
+    init_db(jconn)   # create tables + indexes (idempotent)
     app.state.journal = jconn
     logger.info("Database connections ready.")
 
