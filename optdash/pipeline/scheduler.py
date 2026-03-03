@@ -16,15 +16,15 @@ _scheduler: BackgroundScheduler | None = None
 
 def _is_market_hours(now: datetime) -> bool:
     """Return True if current IST time is within market hours."""
+    from datetime import time
     t = now.time()
     open_h,  open_m  = map(int, settings.MARKET_OPEN.split(":"))
     close_h, close_m = map(int, settings.MARKET_CLOSE.split(":"))
-    from datetime import time
     return time(open_h, open_m) <= t <= time(close_h, close_m)
 
 
 def _run_tick(
-    conn: duckdb.DuckDBPyConnection,
+    conn:  duckdb.DuckDBPyConnection,
     jconn: sqlite3.Connection,
 ) -> None:
     """Called every 5 min during market hours."""
@@ -38,10 +38,10 @@ def _run_tick(
     logger.info("[Tick] {} {}", trade_date, snap_time)
 
     # Deferred imports to avoid circular deps at module load
-    from optdash.ai.recommender   import generate_recommendation
-    from optdash.ai.tracker       import track_open_positions, expire_stale_recommendations
+    from optdash.ai.recommender    import generate_recommendation
+    from optdash.ai.tracker        import track_open_positions, expire_stale_recommendations
     from optdash.ai.shadow_tracker import track_shadow_positions
-    from optdash.ai.eod           import eod_force_close, finalize_all_shadows
+    from optdash.ai.eod            import eod_force_close, finalize_all_shadows
 
     underlyings = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"]
 
@@ -63,24 +63,29 @@ def _run_tick(
     except Exception as e:
         logger.error("expire_stale_recommendations failed: {}", e)
 
-    # Step 4: Generate new recommendations for each underlying
+    # Step 4: Generate new recommendations
     for underlying in underlyings:
         try:
             rec = generate_recommendation(conn, jconn, trade_date, snap_time, underlying)
             if rec:
-                logger.info("[AI] Recommendation: {} {} {} @ {}",
-                    underlying, rec["option_type"], rec["strike_price"], rec["entry_premium"])
+                logger.info(
+                    "[AI] Recommendation: {} {} {} @ {}",
+                    underlying, rec["option_type"],
+                    rec["strike_price"],  rec["entry_premium"],
+                )
         except Exception as e:
             logger.error("generate_recommendation failed for {}: {}", underlying, e)
 
-    # Step 5: EOD sweep
-    if snap_time >= settings.EOD_FORCE_CLOSE_TIME:
+    # Step 5: EOD sweeps — fire exactly ONCE at the designated snap.
+    # Using == (not >=) so these don't repeat on every subsequent tick,
+    # which would attempt to re-close already-CLOSED trades/shadows.
+    if snap_time == settings.EOD_FORCE_CLOSE_TIME:
         try:
             eod_force_close(conn, jconn, trade_date)
         except Exception as e:
             logger.error("eod_force_close failed: {}", e)
 
-    if snap_time >= settings.EOD_SWEEP_TIME:
+    if snap_time == settings.EOD_SWEEP_TIME:
         try:
             finalize_all_shadows(conn, jconn, trade_date)
         except Exception as e:
@@ -88,7 +93,7 @@ def _run_tick(
 
 
 def start_scheduler(
-    conn: duckdb.DuckDBPyConnection,
+    conn:  duckdb.DuckDBPyConnection,
     jconn: sqlite3.Connection,
 ) -> BackgroundScheduler:
     """Start the APScheduler background scheduler."""
