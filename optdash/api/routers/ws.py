@@ -4,7 +4,6 @@ import json
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from loguru import logger
 
-from optdash.api.deps import get_duck, get_journal
 from optdash.analytics.gex import get_net_gex
 from optdash.analytics.coc import get_coc_latest
 from optdash.analytics.environment import get_environment_score
@@ -31,11 +30,11 @@ async def live_feed(
     logger.info("WS connect: {} {} {}", underlying, trade_date, snap_time)
     try:
         while True:
-            # Determine effective snap_time
-            if snap_time == "LIVE":
-                eff_snap = _latest_snap(duck, trade_date, underlying)
-            else:
-                eff_snap = snap_time
+            eff_snap = (
+                _latest_snap(duck, trade_date, underlying)
+                if snap_time == "LIVE"
+                else snap_time
+            )
 
             if not eff_snap:
                 await ws.send_json({"error": "no data"})
@@ -45,6 +44,7 @@ async def live_feed(
             payload = _build_payload(duck, journal, trade_date, eff_snap, underlying)
             await ws.send_text(json.dumps(payload, default=str))
             await asyncio.sleep(settings.WS_INTERVAL_SECONDS)
+
     except WebSocketDisconnect:
         logger.info("WS disconnect: {} {}", underlying, snap_time)
     except Exception as e:
@@ -52,9 +52,7 @@ async def live_feed(
         await ws.close()
 
 
-def _latest_snap(
-    duck, trade_date: str, underlying: str
-) -> str | None:
+def _latest_snap(duck, trade_date: str, underlying: str) -> str | None:
     try:
         row = duck.execute(
             """SELECT MAX(snap_time) FROM options_data
@@ -66,28 +64,32 @@ def _latest_snap(
         return None
 
 
-def _build_payload(duck, journal, trade_date, snap_time, underlying) -> dict:
+def _build_payload(
+    duck, journal, trade_date: str, snap_time: str, underlying: str
+) -> dict:
     try:
-        env     = get_environment_score(duck, trade_date, snap_time, underlying)
-        gex     = get_net_gex(duck, trade_date, snap_time, underlying)
-        coc     = get_coc_latest(duck, trade_date, snap_time, underlying)
-        pcr     = get_pcr(duck, trade_date, snap_time, underlying)
-        vex     = get_vex_cex_current(duck, trade_date, snap_time, underlying)
-        alerts  = get_alerts(duck, trade_date, snap_time, underlying)
+        env    = get_environment_score(duck, trade_date, snap_time, underlying)
+        gex    = get_net_gex(duck, trade_date, snap_time, underlying)
+        coc    = get_coc_latest(duck, trade_date, snap_time, underlying)
+        pcr    = get_pcr(duck, trade_date, snap_time, underlying)
+        vex    = get_vex_cex_current(duck, trade_date, snap_time, underlying)
+        alerts = get_alerts(duck, trade_date, snap_time, underlying)
+
         pending = trades.get_pending_trades(journal, underlying=underlying)
         open_t  = trades.get_open_trades(journal, underlying=underlying)
 
         return {
-            "snap_time":    snap_time,
-            "underlying":   underlying,
-            "environment":  env,
-            "gex":          gex,
-            "coc":          coc,
-            "pcr":          pcr,
-            "vex":          vex,
-            "alerts":       alerts[:5],
-            "pending_trade":pending[-1] if pending else None,
-            "open_trade":   open_t[0]   if open_t  else None,
+            "snap_time":     snap_time,
+            "underlying":    underlying,
+            "environment":   env,
+            "gex":           gex,
+            "coc":           coc,
+            "pcr":           pcr,
+            "vex":           vex,
+            "alerts":        alerts[:5],
+            # [0] = most-recent (get_pending_trades ORDER BY created_at DESC)
+            "pending_trade": pending[0] if pending else None,
+            "open_trade":    open_t[0]  if open_t  else None,
         }
     except Exception as e:
         logger.warning("WS _build_payload error: {}", e)
