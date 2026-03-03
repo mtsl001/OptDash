@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "optdash"
+version = "2.0.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi[standard]>=0.111",
+    "uvicorn[standard]>=0.29",
+    "duckdb>=0.10",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "orjson>=3.10",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.2",
+    "python-dotenv>=1.0",
+    "apscheduler>=3.10",
+    "loguru>=0.7",
+    "pyarrow>=15",
+    "websockets>=12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "httpx", "ruff", "mypy"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.ruff]
+line-length = 100

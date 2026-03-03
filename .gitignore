@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment
+.env
+.env.*
+
+# Database / Journal
+*.db
+*.sqlite3
+journals/
+
+# Data files (large — keep local only)
+data/
+*.parquet
+
+# Logs
+logs/
+*.log
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Distribution
+*.whl
+*.tar.gz
