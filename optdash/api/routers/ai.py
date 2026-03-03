@@ -3,22 +3,23 @@ import sqlite3
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel
 
-from optdash.api.deps import get_duck, get_journal
-from optdash.ai.journal import trades, shadow
+from optdash.api.deps import get_journal
+from optdash.ai.journal import trades, shadow, snaps
 from optdash.ai.learning.report import build_learning_report
-from optdash.models import TradeStatus
+from optdash.analytics.pnl import build_theta_sl_series
+from optdash.models import TradeStatus, ExitReason
 
 router = APIRouter()
 
 DEFAULT_UNDERLYING = "NIFTY"
 
 
-# ── Request schemas ───────────────────────────────────────────────────────────
+# ── Request schemas ─────────────────────────────────────────────────────────
 
 class AcceptRequest(BaseModel):
-    trade_id:            int
-    snap_time:           str
-    actual_entry_price:  float | None = None
+    trade_id:           int
+    snap_time:          str
+    actual_entry_price: float | None = None
 
 
 class RejectRequest(BaseModel):
@@ -28,12 +29,12 @@ class RejectRequest(BaseModel):
 
 
 class CloseRequest(BaseModel):
-    trade_id:    int
-    exit_price:  float
-    snap_time:   str
+    trade_id:   int
+    exit_price: float
+    snap_time:  str
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────
 
 @router.get("/recommendation/latest")
 def latest_recommendation(
@@ -43,7 +44,7 @@ def latest_recommendation(
     pending = trades.get_pending_trades(jconn, underlying=underlying)
     if not pending:
         return {"status": "NO_RECOMMENDATION"}
-    return pending[-1]   # most recent
+    return pending[0]   # index 0 = most-recent (ORDER BY created_at DESC)
 
 
 @router.get("/position/live")
@@ -57,6 +58,23 @@ def live_position(
     return open_trades[0]
 
 
+@router.get("/position/snaps/{trade_id}")
+def position_snaps(
+    trade_id: int,
+    jconn: sqlite3.Connection = Depends(get_journal),
+):
+    """Full snap history: PnL, Greeks attribution, IV crush, theta SL series."""
+    trade = trades.get_trade(jconn, trade_id)
+    if not trade:
+        raise HTTPException(404, "Trade not found")
+    snap_list = snaps.get_snaps_for_trade(jconn, trade_id)
+    return {
+        "trade":           trade,
+        "snaps":           snap_list,
+        "theta_sl_series": build_theta_sl_series(trade, snap_list),
+    }
+
+
 @router.post("/accept")
 def accept(
     req:   AcceptRequest,
@@ -66,9 +84,11 @@ def accept(
     if not trade:
         raise HTTPException(404, "Trade not found")
     if trade["status"] != TradeStatus.GENERATED.value:
-        raise HTTPException(400, f"Cannot accept trade in status {trade['status']}")
+        raise HTTPException(
+            400, f"Cannot accept trade in status '{trade['status']}'."
+        )
 
-    # Create shadow for comparison
+    # Create shadow trade for what-if comparison tracking
     shadow.create_shadow(jconn, {
         "trade_id":      req.trade_id,
         "trade_date":    trade["trade_date"],
@@ -91,10 +111,19 @@ def reject(
     trade = trades.get_trade(jconn, req.trade_id)
     if not trade:
         raise HTTPException(404, "Trade not found")
-    if trade["status"] not in (TradeStatus.GENERATED.value, TradeStatus.ACCEPTED.value):
-        raise HTTPException(400, f"Cannot reject trade in status {trade['status']}")
 
-    # Shadow: track what would have happened
+    # Only GENERATED recommendations can be rejected.
+    # Live positions (ACCEPTED) must be closed via /close-trade.
+    if trade["status"] != TradeStatus.GENERATED.value:
+        raise HTTPException(
+            400,
+            f"Can only reject GENERATED recommendations "
+            f"(current status='{trade['status']}'). "
+            "Use /close-trade to exit a live position."
+        )
+
+    # Shadow: track what would have happened had we taken this recommendation.
+    # This is the core of the learning engine — CLEAN_MISS vs GOOD_SKIP.
     shadow.create_shadow(jconn, {
         "trade_id":      req.trade_id,
         "trade_date":    trade["trade_date"],
@@ -110,24 +139,25 @@ def reject(
 
 
 @router.post("/close-trade")
-def close_trade(
+def close_position(
     req:   CloseRequest,
     jconn: sqlite3.Connection = Depends(get_journal),
 ):
+    """Manually close a live (ACCEPTED) position."""
     trade = trades.get_trade(jconn, req.trade_id)
     if not trade:
         raise HTTPException(404, "Trade not found")
     if trade["status"] != TradeStatus.ACCEPTED.value:
-        raise HTTPException(400, f"Trade not open (status={trade['status']})")
+        raise HTTPException(400, f"Trade not open (status='{trade['status']}')")
 
-    entry    = trade["actual_entry_price"] or trade["entry_premium"]
-    pnl_abs  = round(req.exit_price - entry, 2)
-    pnl_pct  = round(pnl_abs / entry * 100, 2)
+    entry   = trade["actual_entry_price"] or trade["entry_premium"]
+    pnl_abs = round(req.exit_price - entry, 2)
+    pnl_pct = round(pnl_abs / entry * 100, 2)
 
     trades.close_trade(jconn, req.trade_id, {
         "exit_premium":   req.exit_price,
         "exit_snap_time": req.snap_time,
-        "exit_reason":    "MANUAL_CLOSE",
+        "exit_reason":    ExitReason.MANUAL_EXIT.value,   # was "MANUAL_CLOSE" (invalid)
         "final_pnl_abs":  pnl_abs,
         "final_pnl_pct":  pnl_pct,
     })
@@ -136,10 +166,10 @@ def close_trade(
 
 @router.get("/journal/history")
 def trade_history(
-    page:       int         = Query(1, ge=1),
-    per_page:   int         = Query(20, ge=5, le=100),
-    underlying: str | None  = Query(None),
-    status:     str | None  = Query(None),
+    page:       int        = Query(1,  ge=1),
+    per_page:   int        = Query(20, ge=5, le=100),
+    underlying: str | None = Query(None),
+    status:     str | None = Query(None),
     jconn: sqlite3.Connection = Depends(get_journal),
 ):
     return trades.get_trade_history(

@@ -27,6 +27,7 @@ def get_open_trades(
     if underlying:
         q += " AND underlying=?"
         params.append(underlying)
+    q += " ORDER BY created_at DESC"
     return _fetchall(conn, q, params)
 
 
@@ -37,6 +38,7 @@ def get_pending_trades(
     if underlying:
         q += " AND underlying=?"
         params.append(underlying)
+    q += " ORDER BY created_at DESC"
     return _fetchall(conn, q, params)
 
 
@@ -169,7 +171,7 @@ def close_trade(
 def _fetchall(conn: sqlite3.Connection, q: str, params: list) -> list[dict]:
     """Execute query and return list of dicts.
     Requires row_factory=sqlite3.Row (set in deps.py and scheduler.py).
-    Single-pass: one execute call, one fetchall.
+    Single-pass: one execute, one fetchall.
     """
     cur  = conn.execute(q, params)
     cols = [d[0] for d in cur.description]
