@@ -1,5 +1,11 @@
-"""Entry point — starts FastAPI + scheduler."""
-import asyncio
+"""Entry point — starts FastAPI + APScheduler.
+
+Usage:  python run_api.py
+
+Lifespan here owns both DB connections (via startup/shutdown)
+and the scheduler.  The create_app() factory receives this
+lifespan so there is no double-initialisation.
+"""
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from loguru import logger
@@ -14,19 +20,27 @@ from optdash.scheduler import create_scheduler
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting OptDash API + Scheduler...")
+
+    # 1. Open DB connections
     await startup(app)
 
+    # 2. Start scheduler
     scheduler = create_scheduler(
         duck_path=settings.DUCKDB_PATH,
         journal_path=settings.JOURNAL_DB_PATH,
     )
     scheduler.start()
     app.state.scheduler = scheduler
-    logger.info("Scheduler started (interval={}s)", settings.SCHEDULER_INTERVAL_SECONDS)
+    logger.info(
+        "Scheduler started — interval={}s, underlyings={}",
+        settings.SCHEDULER_INTERVAL_SECONDS,
+        settings.UNDERLYINGS,
+    )
 
     yield
 
-    logger.info("Shutting down...")
+    # 3. Graceful shutdown
+    logger.info("Shutting down OptDash...")
     try:
         scheduler.shutdown(wait=False)
     except Exception:
@@ -34,8 +48,9 @@ async def lifespan(app: FastAPI):
     await shutdown(app)
 
 
-app = create_app()
-app.router.lifespan_context = lifespan
+# Pass the full lifespan (with scheduler) into the app factory.
+# This is the single source of truth for startup/teardown.
+app = create_app(lifespan=lifespan)
 
 
 if __name__ == "__main__":
@@ -44,5 +59,5 @@ if __name__ == "__main__":
         host=settings.API_HOST,
         port=settings.API_PORT,
         reload=False,
-        log_level="info",
+        log_level=settings.LOG_LEVEL.lower(),
     )

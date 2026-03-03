@@ -1,5 +1,6 @@
 """FastAPI application factory."""
 from contextlib import asynccontextmanager
+from typing import Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
@@ -10,20 +11,26 @@ from optdash.api.routers import market, micro, screener, ai, ws
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("OptDash API starting up...")
+async def _default_lifespan(app: FastAPI):
+    """Default lifespan for standalone use (uvicorn optdash.api.app:app).
+    DB connections only — no scheduler.
+    """
+    logger.info("OptDash API starting up (standalone)...")
     await startup(app)
     yield
     logger.info("OptDash API shutting down...")
     await shutdown(app)
 
 
-def create_app() -> FastAPI:
+def create_app(lifespan: Any = None) -> FastAPI:
+    """Factory.  Pass a custom lifespan to add scheduler or other startup
+    logic (e.g. from run_api.py).  Defaults to DB-only lifespan.
+    """
     app = FastAPI(
         title="OptDash API",
         version="2.0.0",
         description="Options Analytics & AI Trading Engine",
-        lifespan=lifespan,
+        lifespan=lifespan or _default_lifespan,
     )
 
     app.add_middleware(
@@ -47,4 +54,5 @@ def create_app() -> FastAPI:
     return app
 
 
+# Standalone instance — works with: uvicorn optdash.api.app:app
 app = create_app()
