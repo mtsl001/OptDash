@@ -7,11 +7,11 @@ from optdash.analytics.gex import get_net_gex, _get_gex_peak
 from optdash.analytics.coc import get_coc_latest, get_atm_obi, get_futures_obi
 from optdash.analytics.iv  import get_ivr_ivp
 from optdash.analytics.pcr import get_pcr
-from optdash.analytics.vex_cex import get_vex_cex_current, _is_dealer_oclock
+from optdash.analytics.vex_cex import get_vex_cex_current   # dealer_oclock sourced from result dict
 
 
 def get_environment_score(
-    conn: duckdb.DuckDBPyConnection,
+    conn:       duckdb.DuckDBPyConnection,
     trade_date: str,
     snap_time:  str,
     underlying: str,
@@ -19,9 +19,10 @@ def get_environment_score(
 ) -> dict:
     """
     11-point environment gate.
-    Conditions 1-8 are standard (max 9 pts).
-    Conditions 9-11 are starred — extra weight (max 2 extra pts).
-    Returns score, verdict, per-condition breakdown.
+    Conditions 1-8: standard (1 pt each = 8 pts max).
+    Condition 9:    VEX alignment ★★ (2 pts).
+    Condition 10:   Dealer O'Clock guard ★ (1 pt).
+    Max = 11 pts.
     """
     try:
         gex_data = get_net_gex(conn, trade_date, snap_time, underlying)
@@ -32,70 +33,68 @@ def get_environment_score(
         atm_obi  = get_atm_obi(conn, trade_date, snap_time, underlying)
         fut_obi  = get_futures_obi(conn, trade_date, snap_time, underlying)
 
-        # Extract values (safe defaults if data missing)
-        gex_pct     = gex_data.get("pct_of_peak", 100.0)
-        vcoc        = coc_data.get("v_coc_15m", 0.0)
-        fut_bs      = fut_obi
-        pcr_div     = pcr_data.get("pcr_divergence", 0.0)
-        ivp         = iv_data.get("ivp", 100.0)
-        obi         = atm_obi
-        vex_total   = vex_data.get("vex_total_M", 0.0)
-        dealer_oc   = vex_data.get("dealer_oclock", False)
-        dte         = vex_data.get("dte", 7)
+        gex_pct   = gex_data.get("pct_of_peak", 100.0)
+        vcoc      = coc_data.get("v_coc_15m", 0.0)
+        fut_bs    = fut_obi
+        pcr_div   = pcr_data.get("pcr_divergence", 0.0)
+        ivp       = iv_data.get("ivp", 100.0)
+        obi       = atm_obi
+        vex_total = vex_data.get("vex_total_M", 0.0)
+        dealer_oc = vex_data.get("dealer_oclock", False)  # already computed in get_vex_cex_current
 
         conditions: dict[str, dict] = {}
 
-        # Condition 1: GEX declining (1 pt)
+        # C1: GEX declining (1 pt)
         c1_met = gex_pct <= settings.GEX_DECLINE_THRESHOLD * 100
         conditions["gex_declining"] = {
             "met": c1_met, "value": round(gex_pct, 1),
             "points": 1, "note": f"{gex_pct:.0f}% of day peak"
         }
 
-        # Condition 2: V_CoC velocity (1 pt)
+        # C2: V_CoC velocity (1 pt)
         c2_met = abs(vcoc) > abs(settings.VCOC_BULL_THRESHOLD)
         conditions["vcoc_signal"] = {
             "met": c2_met, "value": round(vcoc, 2),
             "points": 1, "note": f"V_CoC 15m = {vcoc:+.2f}"
         }
 
-        # Condition 3: Futures OBI bearish (1 pt)
+        # C3: Futures OBI bearish (1 pt)
         c3_met = fut_bs < settings.FUT_OBI_BEAR_THRESHOLD
         conditions["fut_bs_ratio"] = {
             "met": c3_met, "value": round(fut_bs, 4),
             "points": 1, "note": f"Fut OBI = {fut_bs:.3f}"
         }
 
-        # Condition 4: PCR divergence (1 pt)
-        c4_met = (abs(pcr_div) > 0.15)
+        # C4: PCR divergence (1 pt)
+        c4_met = abs(pcr_div) > 0.15
         conditions["pcr_divergence"] = {
             "met": c4_met, "value": round(pcr_div, 4),
             "points": 1, "note": f"Divergence = {pcr_div:+.4f}"
         }
 
-        # Condition 5: IV cheap (IVP < 50) (1 pt)
+        # C5: IV cheap (IVP < 50) (1 pt)
         c5_met = (ivp or 100) < 50
         conditions["ivp_cheap"] = {
             "met": c5_met, "value": round(ivp or 100, 1),
             "points": 1, "note": f"IVP = {ivp:.0f}th pct"
         }
 
-        # Condition 6: ATM OBI significant (1 pt)
+        # C6: ATM OBI significant (1 pt)
         c6_met = abs(obi) > settings.OBI_THRESHOLD
         conditions["obi_negative"] = {
             "met": c6_met, "value": round(obi, 4),
             "points": 1, "note": f"ATM OBI = {obi:+.4f}"
         }
 
-        # Condition 7: IV term structure not backwardation (1 pt)
-        ts = iv_data.get("shape", "FLAT")
+        # C7: IV term structure not backwardation (1 pt)
+        ts     = iv_data.get("shape", "FLAT")
         c7_met = ts != "BACKWARDATION"
         conditions["term_structure_ok"] = {
             "met": c7_met, "value": ts,
             "points": 1, "note": f"Shape = {ts}"
         }
 
-        # Condition 8: Session not midday chop (1 pt)
+        # C8: Session not midday chop (1 pt)
         session = get_market_session(snap_time)
         c8_met  = session != MarketSession.MIDDAY_CHOP
         conditions["session_ok"] = {
@@ -103,7 +102,7 @@ def get_environment_score(
             "points": 1, "note": f"Session = {session.value}"
         }
 
-        # Condition 9: VEX aligned with direction ★ (2 pts)
+        # C9: VEX aligned with direction ★★ (2 pts)
         c9_met = False
         if direction == "CE" and vex_total > 0:
             c9_met = True
@@ -113,20 +112,22 @@ def get_environment_score(
             c9_met = True
         conditions["vex_aligned"] = {
             "met": c9_met, "value": round(vex_total, 2),
-            "points": 2, "note": "VEX mechanical alignment ★ (2 pts)"
+            "points": 2, "note": "VEX mechanical alignment ★★ (2 pts)"
         }
 
-        # Condition 10: Not Dealer O'Clock on DTE=1 ★ (bonus if safe)
+        # C10: Not Dealer O'Clock on DTE=1 ★ (1 pt bonus if safe)
         c10_met = not dealer_oc
         conditions["not_charm_distortion"] = {
-            "met": c10_met, "value": "SAFE" if c10_met else "DEALER_OCLOCK",
-            "points": 1, "note": "Dealer O'Clock guard ★"
+            "met": c10_met,
+            "value": "SAFE" if c10_met else "DEALER_OCLOCK",
+            "points": 1,
+            "note": "Dealer O'Clock guard ★"
         }
 
-        # Tally score
-        score = sum(c["points"] for c in conditions.values() if c["met"])
-        score = min(score, settings.GATE_MAX_SCORE)
-
+        score   = min(
+            sum(c["points"] for c in conditions.values() if c["met"]),
+            settings.GATE_MAX_SCORE
+        )
         verdict = (
             GateVerdict.GO.value    if score >= settings.GATE_GO_THRESHOLD   else
             GateVerdict.WAIT.value  if score >= settings.GATE_WAIT_THRESHOLD  else
@@ -134,16 +135,19 @@ def get_environment_score(
         )
 
         return {
-            "score": score,
-            "max_score": settings.GATE_MAX_SCORE,
-            "verdict": verdict,
+            "score":      score,
+            "max_score":  settings.GATE_MAX_SCORE,
+            "verdict":    verdict,
             "conditions": conditions,
-            "session": session.value,
+            "session":    session.value,
         }
+
     except Exception as e:
         logger.warning("get_environment_score error: {}", e)
-        return {"score": 0, "max_score": settings.GATE_MAX_SCORE,
-                "verdict": GateVerdict.NO_GO.value, "conditions": {}}
+        return {
+            "score": 0, "max_score": settings.GATE_MAX_SCORE,
+            "verdict": GateVerdict.NO_GO.value, "conditions": {}, "session": ""
+        }
 
 
 def get_market_session(snap_time: str) -> MarketSession:

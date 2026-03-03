@@ -1,10 +1,9 @@
 """Trades DAO — CRUD for the trades table."""
 import sqlite3
-from typing import Any
 
 
 def create_trade(conn: sqlite3.Connection, data: dict) -> int:
-    cols = ", ".join(data.keys())
+    cols         = ", ".join(data.keys())
     placeholders = ", ".join(["?"] * len(data))
     cur = conn.execute(
         f"INSERT INTO trades ({cols}) VALUES ({placeholders})",
@@ -18,89 +17,96 @@ def get_trade(conn: sqlite3.Connection, trade_id: int) -> dict | None:
     row = conn.execute(
         "SELECT * FROM trades WHERE id=?", [trade_id]
     ).fetchone()
-    return _row_to_dict(conn, row) if row else None
+    return dict(row) if row else None
 
 
-def get_open_trades(conn: sqlite3.Connection, underlying: str | None = None) -> list[dict]:
-    q = "SELECT * FROM trades WHERE status='ACCEPTED'"
-    params = []
+def get_open_trades(
+    conn: sqlite3.Connection, underlying: str | None = None
+) -> list[dict]:
+    q, params = "SELECT * FROM trades WHERE status='ACCEPTED'", []
     if underlying:
         q += " AND underlying=?"
         params.append(underlying)
     return _fetchall(conn, q, params)
 
 
-def get_pending_trades(conn: sqlite3.Connection, underlying: str | None = None) -> list[dict]:
-    q = "SELECT * FROM trades WHERE status='GENERATED'"
-    params = []
+def get_pending_trades(
+    conn: sqlite3.Connection, underlying: str | None = None
+) -> list[dict]:
+    q, params = "SELECT * FROM trades WHERE status='GENERATED'", []
     if underlying:
         q += " AND underlying=?"
         params.append(underlying)
     return _fetchall(conn, q, params)
 
 
-def get_latest_trade(conn: sqlite3.Connection, underlying: str) -> dict | None:
+def get_latest_trade(
+    conn: sqlite3.Connection, underlying: str
+) -> dict | None:
     row = conn.execute(
         """SELECT * FROM trades WHERE underlying=?
            ORDER BY created_at DESC LIMIT 1""",
         [underlying]
     ).fetchone()
-    return _row_to_dict(conn, row) if row else None
+    return dict(row) if row else None
 
 
 def get_trade_history(
-    conn: sqlite3.Connection,
-    page: int = 1,
-    per_page: int = 20,
+    conn:       sqlite3.Connection,
+    page:       int = 1,
+    per_page:   int = 20,
     underlying: str | None = None,
-    status: str | None = None,
+    status:     str | None = None,
 ) -> dict:
     offset = (page - 1) * per_page
-    where_clauses, params = [], []
+    where_clauses: list[str] = []
+    params:        list      = []
+
     if underlying:
         where_clauses.append("underlying=?")
         params.append(underlying)
     if status:
         where_clauses.append("status=?")
         params.append(status)
+
     where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
     total = conn.execute(
         f"SELECT COUNT(*) FROM trades {where}", params
     ).fetchone()[0]
 
-    rows = conn.execute(
+    trade_rows = _fetchall(
+        conn,
         f"SELECT * FROM trades {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        params + [per_page, offset]
-    ).fetchall()
+        params + [per_page, offset],
+    )
 
     return {
-        "trades":    [_row_to_dict(conn, r) for r in rows],
-        "total":     total,
-        "page":      page,
-        "per_page":  per_page,
-        "pages":     (total + per_page - 1) // per_page,
+        "trades":   trade_rows,
+        "total":    total,
+        "page":     page,
+        "per_page": per_page,
+        "pages":    max(1, (total + per_page - 1) // per_page),
     }
 
 
 def update_status(
-    conn: sqlite3.Connection,
-    trade_id: int,
-    status: str,
+    conn:         sqlite3.Connection,
+    trade_id:     int,
+    status:       str,
     state_reason: str | None = None,
 ) -> None:
     conn.execute(
-        """UPDATE trades SET status=?, updated_at=datetime('now')
-           WHERE id=?""",
+        "UPDATE trades SET status=?, updated_at=datetime('now') WHERE id=?",
         [status, trade_id]
     )
     conn.commit()
 
 
 def accept_trade(
-    conn: sqlite3.Connection,
-    trade_id: int,
-    snap_time: str,
+    conn:               sqlite3.Connection,
+    trade_id:           int,
+    snap_time:          str,
     actual_entry_price: float | None = None,
 ) -> None:
     conn.execute(
@@ -116,10 +122,10 @@ def accept_trade(
 
 
 def reject_trade(
-    conn: sqlite3.Connection,
+    conn:     sqlite3.Connection,
     trade_id: int,
-    reason: str,
-    note: str | None = None,
+    reason:   str,
+    note:     str | None = None,
 ) -> None:
     conn.execute(
         """UPDATE trades
@@ -132,9 +138,9 @@ def reject_trade(
 
 
 def close_trade(
-    conn: sqlite3.Connection,
+    conn:     sqlite3.Connection,
     trade_id: int,
-    data: dict,
+    data:     dict,
 ) -> None:
     conn.execute(
         """UPDATE trades
@@ -158,20 +164,13 @@ def close_trade(
     conn.commit()
 
 
-def _row_to_dict(conn: sqlite3.Connection, row) -> dict:
-    if hasattr(conn, 'row_factory') and conn.row_factory:
-        return dict(row)
-    desc = conn.execute("SELECT * FROM trades LIMIT 0").description
-    cols = [d[0] for d in desc]
-    return dict(zip(cols, row))
-
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _fetchall(conn: sqlite3.Connection, q: str, params: list) -> list[dict]:
-    rows = conn.execute(q, params).fetchall()
-    if not rows:
-        return []
-    desc  = conn.execute(q.replace("SELECT *", "SELECT * FROM trades LIMIT 0") if False else q + " LIMIT 0", params).description
-    # Simpler: use cursor description from the actual query
-    cur   = conn.execute(q, params)
-    cols  = [d[0] for d in cur.description]
-    return [dict(zip(cols, r)) for r in rows]
+    """Execute query and return list of dicts.
+    Requires row_factory=sqlite3.Row (set in deps.py and scheduler.py).
+    Single-pass: one execute call, one fetchall.
+    """
+    cur  = conn.execute(q, params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]

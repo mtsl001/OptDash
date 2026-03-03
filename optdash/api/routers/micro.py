@@ -4,7 +4,7 @@ from optdash.api.deps import get_duck
 from optdash.analytics.pcr import get_pcr_series
 from optdash.analytics.alerts import get_alerts
 from optdash.analytics.microstructure import get_volume_velocity
-from optdash.analytics.vex_cex import get_vex_cex_series
+from optdash.analytics.vex_cex import get_vex_cex_full   # was incorrectly get_vex_cex_series
 
 router = APIRouter()
 
@@ -46,4 +46,4 @@ def vex_cex(
     underlying: str = Query(DEFAULT_UNDERLYING),
     duck = Depends(get_duck),
 ):
-    return get_vex_cex_series(duck, trade_date, snap_time, underlying)
+    return get_vex_cex_full(duck, trade_date, snap_time, underlying)

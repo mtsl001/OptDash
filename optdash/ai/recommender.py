@@ -2,16 +2,15 @@
 import json
 import duckdb
 import sqlite3
-from datetime import datetime
 from loguru import logger
 from zoneinfo import ZoneInfo
 
 from optdash.config import settings
-from optdash.models import Direction, TradeStatus, ExitReason
+from optdash.models import Direction, TradeStatus
 from optdash.analytics.environment import get_environment_score, get_market_session
 from optdash.analytics.gex import get_net_gex, get_max_pain
 from optdash.analytics.iv import get_ivr_ivp
-from optdash.analytics.vex_cex import get_vex_cex_current, _is_dealer_oclock
+from optdash.analytics.vex_cex import get_vex_cex_current   # dealer_oclock in result
 from optdash.analytics.screener import get_strikes
 from optdash.ai.direction import get_directional_bias
 from optdash.ai.confidence import compute_confidence
@@ -35,48 +34,53 @@ def generate_recommendation(
     Called every scheduler tick for each underlying.
     Returns the generated trade card dict, or None if no recommendation issued.
     """
-    # Guard: open position exists
+    # Guard: open position exists — never recommend while in trade
     open_trades = trades.get_open_trades(jconn, underlying=underlying)
     if open_trades:
         return None
 
-    # Guard: pending recommendation exists
+    # Guard: pending recommendation already issued
     pending = trades.get_pending_trades(jconn, underlying=underlying)
     if pending:
         return None
 
-    # Gather inputs
+    # ── Gather all inputs ──────────────────────────────────────────────────────
     gate      = get_environment_score(conn, trade_date, snap_time, underlying)
     session   = get_market_session(snap_time)
     dir_res   = get_directional_bias(conn, trade_date, snap_time, underlying)
     iv_data   = get_ivr_ivp(conn, trade_date, snap_time, underlying)
     gex_data  = get_net_gex(conn, trade_date, snap_time, underlying)
     vex_data  = get_vex_cex_current(conn, trade_date, snap_time, underlying)
-    dealer_oc = _is_dealer_oclock(snap_time, conn, trade_date, underlying)
+
+    # dealer_oclock is already computed inside get_vex_cex_current — no extra call needed
+    dealer_oc = vex_data.get("dealer_oclock", False)
 
     nearest_expiry = _nearest_expiry(conn, trade_date, snap_time, underlying)
-    max_pain  = get_max_pain(conn, trade_date, snap_time, underlying,
-                              expiry_date=nearest_expiry) if nearest_expiry else {}
+    max_pain = (
+        get_max_pain(conn, trade_date, snap_time, underlying, expiry_date=nearest_expiry)
+        if nearest_expiry else {}
+    )
 
     if dir_res["direction"] == Direction.NEUTRAL.value:
         return None
 
     direction = dir_res["direction"]
 
-    # Select best strike
-    strike_list = get_strikes(conn, trade_date, snap_time, underlying,
-                               top_n=settings.SCREENER_TOP_N)
-    candidates  = [s for s in strike_list if s["option_type"] == direction]
+    # ── Best strike selection ───────────────────────────────────────────────────
+    strike_list = get_strikes(
+        conn, trade_date, snap_time, underlying, top_n=settings.SCREENER_TOP_N
+    )
+    candidates = [s for s in strike_list if s["option_type"] == direction]
     if not candidates:
         return None
     strike = candidates[0]
 
-    # Learning context
+    # ── Learning context (historical win-rate for this session/direction) ──────────
     learning = stats.get_session_stats(
         jconn, underlying=underlying, direction=direction, session=session
     )
 
-    # Confidence
+    # ── Confidence score ─────────────────────────────────────────────────────────
     conf_result = compute_confidence(
         gate_score=gate["score"],
         direction_result=dir_res,
@@ -89,7 +93,7 @@ def generate_recommendation(
     )
     confidence = conf_result["confidence"]
 
-    # Pre-flight
+    # ── Pre-flight hard rules ────────────────────────────────────────────────────
     passed, failures = run_pre_flight(
         gate_score=gate["score"],
         confidence=confidence,
@@ -100,18 +104,20 @@ def generate_recommendation(
         dealer_oclock=dealer_oc,
     )
     if not passed:
-        logger.info("Pre-flight failed for {} {}: {}", underlying, snap_time, failures)
+        logger.info(
+            "Pre-flight failed for {} {}: {}", underlying, snap_time, failures
+        )
         return None
 
-    # SL / Target
+    # ── SL / Target ──────────────────────────────────────────────────────────────
     entry_premium = strike["ltp"]
-    sl            = round(entry_premium * (1 - settings.AI_SL_PCT), 2)
-    target        = round(entry_premium * settings.AI_TARGET_MULT, 2)
+    sl     = round(entry_premium * (1 - settings.AI_SL_PCT), 2)
+    target = round(entry_premium * settings.AI_TARGET_MULT, 2)
 
-    # Quality
+    # ── Quality grade ────────────────────────────────────────────────────────────
     quality = compute_quality_score(strike, gate["score"], confidence)
 
-    # Narrative
+    # ── Narrative ───────────────────────────────────────────────────────────────
     narrative = build_narrative(
         direction=direction,
         gate_score=gate["score"],
@@ -124,7 +130,7 @@ def generate_recommendation(
         dealer_oclock=dealer_oc,
     )
 
-    # Write to journal
+    # ── Write to journal ──────────────────────────────────────────────────────────
     trade_id = trades.create_trade(jconn, {
         "trade_date":        trade_date,
         "snap_time":         snap_time,
@@ -162,7 +168,7 @@ def generate_recommendation(
 
 
 def _nearest_expiry(
-    conn: duckdb.DuckDBPyConnection,
+    conn:       duckdb.DuckDBPyConnection,
     trade_date: str,
     snap_time:  str,
     underlying: str,
