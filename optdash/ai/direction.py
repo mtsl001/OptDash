@@ -1,4 +1,15 @@
-"""Directional bias engine — weighted signal voting."""
+"""Directional bias engine — weighted signal voting.
+
+Signal weights:
+  V_CoC velocity spike  → weight 3  (strongest: order-flow momentum)
+  Futures OBI           → weight 2  (institutional positioning)
+  VEX alignment         → weight 2  (dealer mechanical flow)
+  ATM OBI               → weight 1  (options order imbalance)
+  PCR divergence        → weight 1  (retail sentiment contra-indicator)
+
+Max CE/PE weight = 9 (all signals same direction).
+Ties (ce_weight == pe_weight) yield NEUTRAL — no edge when signals cancel.
+"""
 import duckdb
 from loguru import logger
 from optdash.config import settings
@@ -9,19 +20,11 @@ from optdash.analytics.pcr import get_pcr
 
 
 def get_directional_bias(
-    conn: duckdb.DuckDBPyConnection,
+    conn:       duckdb.DuckDBPyConnection,
     trade_date: str,
     snap_time:  str,
     underlying: str,
 ) -> dict:
-    """
-    Priority order:
-    1. V_CoC velocity spike  (weight 3)
-    2. Futures OBI           (weight 2)
-    3. VEX alignment         (weight 2)
-    4. ATM OBI               (weight 1)
-    5. PCR divergence        (weight 1)
-    """
     try:
         coc  = get_coc_latest(conn, trade_date, snap_time, underlying)
         vex  = get_vex_cex_current(conn, trade_date, snap_time, underlying)
@@ -29,10 +32,10 @@ def get_directional_bias(
         pcr  = get_pcr(conn, trade_date, snap_time, underlying)
         fobi = get_futures_obi(conn, trade_date, snap_time, underlying)
 
-        signals = []
+        signals: list[dict] = []
 
-        # Signal 1: V_CoC velocity
-        vcoc = coc.get("v_coc_15m") or 0
+        # ── Signal 1: V_CoC velocity (weight 3) ─────────────────────────────
+        vcoc        = coc.get("v_coc_15m") or 0
         vcoc_active = _is_vcoc_spike_active(conn, trade_date, snap_time, underlying)
         if vcoc > settings.VCOC_BULL_THRESHOLD or (vcoc_active and vcoc > 0):
             signals.append({"signal": "VCOC_BULL", "weight": 3,
@@ -41,7 +44,7 @@ def get_directional_bias(
             signals.append({"signal": "VCOC_BEAR", "weight": 3,
                              "direction": Direction.PE.value, "value": vcoc})
 
-        # Signal 2: Futures OBI
+        # ── Signal 2: Futures OBI (weight 2) ──────────────────────────────
         if fobi < settings.FUT_OBI_BEAR_THRESHOLD:
             signals.append({"signal": "FUT_OBI_BEAR", "weight": 2,
                              "direction": Direction.PE.value, "value": fobi})
@@ -49,7 +52,7 @@ def get_directional_bias(
             signals.append({"signal": "FUT_OBI_BULL", "weight": 2,
                              "direction": Direction.CE.value, "value": fobi})
 
-        # Signal 3: VEX
+        # ── Signal 3: VEX alignment (weight 2) ────────────────────────────
         vex_total = vex.get("vex_total_M", 0)
         if vex_total > 0:
             signals.append({"signal": "VEX_BULL", "weight": 2,
@@ -58,7 +61,7 @@ def get_directional_bias(
             signals.append({"signal": "VEX_BEAR", "weight": 2,
                              "direction": Direction.PE.value, "value": vex_total})
 
-        # Signal 4: ATM OBI
+        # ── Signal 4: ATM OBI (weight 1) ─────────────────────────────────
         if obi > settings.OBI_THRESHOLD:
             signals.append({"signal": "OBI_BULL", "weight": 1,
                              "direction": Direction.CE.value, "value": obi})
@@ -66,7 +69,7 @@ def get_directional_bias(
             signals.append({"signal": "OBI_BEAR", "weight": 1,
                              "direction": Direction.PE.value, "value": obi})
 
-        # Signal 5: PCR divergence
+        # ── Signal 5: PCR divergence (weight 1) ───────────────────────────
         div = pcr.get("pcr_divergence", 0)
         if div > settings.PCR_DIV_BULL_THRESHOLD:
             signals.append({"signal": "PCR_RETAIL_PUTS", "weight": 1,
@@ -78,11 +81,22 @@ def get_directional_bias(
         ce_weight = sum(s["weight"] for s in signals if s["direction"] == Direction.CE.value)
         pe_weight = sum(s["weight"] for s in signals if s["direction"] == Direction.PE.value)
 
+        # No signals at all
         if ce_weight == 0 and pe_weight == 0:
             return {"direction": Direction.NEUTRAL.value, "ce_weight": 0,
                     "pe_weight": 0, "margin": 0, "signals": []}
 
-        direction = Direction.CE.value if ce_weight >= pe_weight else Direction.PE.value
+        # Tie — contradictory signals cancel, no tradeable edge
+        if ce_weight == pe_weight:
+            return {
+                "direction": Direction.NEUTRAL.value,
+                "ce_weight": ce_weight,
+                "pe_weight": pe_weight,
+                "margin":    0,
+                "signals":   signals,
+            }
+
+        direction = Direction.CE.value if ce_weight > pe_weight else Direction.PE.value
         return {
             "direction": direction,
             "ce_weight": ce_weight,
@@ -90,6 +104,7 @@ def get_directional_bias(
             "margin":    abs(ce_weight - pe_weight),
             "signals":   signals,
         }
+
     except Exception as e:
         logger.warning("get_directional_bias error: {}", e)
         return {"direction": Direction.NEUTRAL.value, "ce_weight": 0,
@@ -97,24 +112,36 @@ def get_directional_bias(
 
 
 def _is_vcoc_spike_active(
-    conn: duckdb.DuckDBPyConnection,
+    conn:       duckdb.DuckDBPyConnection,
     trade_date: str,
     snap_time:  str,
     underlying: str,
 ) -> bool:
-    """True if a V_CoC spike occurred within VCOC_SPIKE_EXPIRY_SNAPS snaps."""
+    """
+    True if a V_CoC spike occurred within the last VCOC_SPIKE_EXPIRY_SNAPS snaps.
+    Fetches the N most-recent distinct snap_times, then checks V_CoC for each.
+    This correctly scopes memory to a rolling window rather than all-day history.
+    """
     try:
-        rows = conn.execute("""
-            SELECT v_coc_15m FROM options_data
+        snap_rows = conn.execute("""
+            SELECT DISTINCT snap_time FROM options_data
             WHERE trade_date=? AND underlying=? AND snap_time<=?
-              AND ABS(v_coc_15m) > ?
             ORDER BY snap_time DESC
             LIMIT ?
         """, [
             trade_date, underlying, snap_time,
-            abs(settings.VCOC_BULL_THRESHOLD),
             settings.VCOC_SPIKE_EXPIRY_SNAPS,
         ]).fetchall()
-        return len(rows) > 0
+
+        if not snap_rows:
+            return False
+
+        threshold = abs(settings.VCOC_BULL_THRESHOLD)
+        for (t,) in snap_rows:
+            coc = get_coc_latest(conn, trade_date, t, underlying)
+            if abs(coc.get("v_coc_15m", 0) or 0) > threshold:
+                return True
+        return False
+
     except Exception:
         return False

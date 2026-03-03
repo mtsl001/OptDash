@@ -17,7 +17,7 @@ from optdash.ai.confidence import compute_confidence
 from optdash.ai.narrative import build_narrative
 from optdash.ai.pre_flight import run_pre_flight
 from optdash.ai.quality import compute_quality_score
-from optdash.ai.journal import trades, shadow
+from optdash.ai.journal import trades             # shadow removed — not used here
 from optdash.ai.learning import stats
 
 IST = ZoneInfo("Asia/Kolkata")

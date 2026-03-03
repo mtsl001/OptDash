@@ -1,18 +1,20 @@
 """PnL analytics — theta SL, Greeks attribution, theta clock."""
 from typing import Any
 from loguru import logger
+from optdash.config import settings
 
 
 def compute_theta_sl(entry_premium: float, theta: float, minutes_elapsed: int) -> float:
     """
     Theta-adjusted stop loss.
-    SL rises as theta erodes time value — locks in decay-adjusted minimum exit.
-    theta is negative (daily), so daily = theta/6.5 per hour.
+    SL floor rises as theta erodes time value — locks in decay-adjusted minimum exit.
+    Uses AI_SL_PCT from config (default 0.35 → SL at 65% of adjusted entry).
     """
-    theta_per_min = abs(theta or 0) / (6.5 * 60)
-    decay         = theta_per_min * minutes_elapsed
-    adjusted_entry= max(0.01, entry_premium - decay)
-    return round(adjusted_entry * 0.65, 2)
+    sl_multiplier  = 1.0 - settings.AI_SL_PCT    # honours config — not hardcoded
+    theta_per_min  = abs(theta or 0) / (6.5 * 60)
+    decay          = theta_per_min * minutes_elapsed
+    adjusted_entry = max(0.01, entry_premium - decay)
+    return round(adjusted_entry * sl_multiplier, 2)
 
 
 def compute_pnl_attribution(
@@ -31,39 +33,43 @@ def compute_pnl_attribution(
         current_t = current.get("snap_time", "09:15")
         minutes   = _minutes_between(entry_t, current_t)
 
-        delta  = entry.get("delta",  0) or 0
-        gamma  = entry.get("gamma",  0) or 0
-        vega   = entry.get("vega",   0) or 0
-        theta  = entry.get("theta",  0) or 0
+        delta = entry.get("delta",  0) or 0
+        gamma = entry.get("gamma",  0) or 0
+        vega  = entry.get("vega",   0) or 0
+        theta = entry.get("theta",  0) or 0
 
-        delta_pnl  = round(delta * spot_chg, 2)
-        gamma_pnl  = round(0.5 * gamma * spot_chg ** 2, 2)
-        vega_pnl   = round(vega * iv_chg, 2)
-        theta_pnl  = round(theta / (6.5 * 60) * minutes, 2)
+        delta_pnl = round(delta * spot_chg, 2)
+        gamma_pnl = round(0.5 * gamma * spot_chg ** 2, 2)
+        vega_pnl  = round(vega * iv_chg, 2)
+        theta_pnl = round(theta / (6.5 * 60) * minutes, 2)
 
-        theo_pnl   = delta_pnl + gamma_pnl + vega_pnl + theta_pnl
-        entry_p    = entry.get("premium", 0)  or 0
-        actual_ltp = current.get("ltp",   0)  or 0
-        actual_pnl = round(actual_ltp - entry_p, 2)
-        unexplained= round(actual_pnl - theo_pnl, 2)
+        theo_pnl    = delta_pnl + gamma_pnl + vega_pnl + theta_pnl
+        entry_p     = entry.get("premium", 0)  or 0
+        actual_ltp  = current.get("ltp",   0)  or 0
+        actual_pnl  = round(actual_ltp - entry_p, 2)
+        unexplained = round(actual_pnl - theo_pnl, 2)
 
         return {
-            "delta_pnl": delta_pnl, "gamma_pnl": gamma_pnl,
-            "vega_pnl":  vega_pnl,  "theta_pnl":  theta_pnl,
+            "delta_pnl":       delta_pnl,
+            "gamma_pnl":       gamma_pnl,
+            "vega_pnl":        vega_pnl,
+            "theta_pnl":       theta_pnl,
             "theoretical_pnl": theo_pnl,
-            "actual_pnl": actual_pnl,
-            "unexplained": unexplained,
+            "actual_pnl":      actual_pnl,
+            "unexplained":     unexplained,
         }
     except Exception as e:
-tml        logger.warning("compute_pnl_attribution error: {}", e)
-        return {"delta_pnl": 0, "gamma_pnl": 0, "vega_pnl": 0,
-                "theta_pnl": 0, "theoretical_pnl": 0, "actual_pnl": 0, "unexplained": 0}
+        logger.warning("compute_pnl_attribution error: {}", e)
+        return {
+            "delta_pnl": 0, "gamma_pnl": 0, "vega_pnl": 0, "theta_pnl": 0,
+            "theoretical_pnl": 0, "actual_pnl": 0, "unexplained": 0,
+        }
 
 
 def compute_theta_clock(theta: float, dte: int, ltp: float, target: float) -> dict:
     """
     Time remaining before theta erosion exceeds the gap to target.
-    Returns hours_remaining, is_urgent.
+    Returns hours_remaining and is_urgent flag.
     """
     theta_per_hour = abs(theta or 0) / 6.5
     gap_to_target  = max(0, (target or ltp) - (ltp or 0))
@@ -75,10 +81,11 @@ def compute_theta_clock(theta: float, dte: int, ltp: float, target: float) -> di
 
 def build_theta_sl_series(trade: dict, snaps: list[dict]) -> list[dict]:
     """Build per-snap theta SL series for the position chart."""
-    result = []
-    entry  = trade["entry_premium"]
-    theta  = trade.get("theta") or 0
-    entry_t= trade.get("snap_time", "09:15")
+    sl_multiplier = 1.0 - settings.AI_SL_PCT   # consistent with compute_theta_sl
+    result  = []
+    entry   = trade["entry_premium"]
+    theta   = trade.get("theta") or 0
+    entry_t = trade.get("snap_time", "09:15")
     for snap in snaps:
         mins = _minutes_between(entry_t, snap["snap_time"])
         sl   = compute_theta_sl(entry, theta, mins)
@@ -86,7 +93,7 @@ def build_theta_sl_series(trade: dict, snaps: list[dict]) -> list[dict]:
             "snap_time":      snap["snap_time"],
             "entry_premium":  entry,
             "theta_daily":    theta,
-            "sl_base":        round(entry * 0.65, 2),
+            "sl_base":        round(entry * sl_multiplier, 2),
             "sl_adjusted":    sl,
             "current_ltp":    snap.get("ltp"),
             "unrealised_pnl": round((snap.get("ltp") or entry) - entry, 2),
