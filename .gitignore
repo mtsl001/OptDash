@@ -1,12 +1,14 @@
 # Python
 __pycache__/
 *.py[cod]
-*.so
+*.pyo
+*.pyd
 .Python
 build/
 dist/
 *.egg-info/
 .eggs/
+*.egg
 
 # Virtual environments
 .venv/
@@ -16,34 +18,34 @@ env/
 # Environment
 .env
 .env.*
+!.env.example
 
-# Database / Journal
-*.db
-*.sqlite3
-journals/
-
-# Data files (large — keep local only)
-data/
-*.parquet
+# DuckDB & SQLite data files
+data/*.duckdb
+data/*.db
+data/*.parquet
+data/raw/
+data/processed/
 
 # Logs
 logs/
 *.log
 
-# Node / Frontend
-node_modules/
-frontend/dist/
-frontend/.vite/
-
 # IDE
 .vscode/
 .idea/
 *.swp
+*.swo
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Distribution
-*.whl
-*.tar.gz
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
