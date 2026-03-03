@@ -1,4 +1,12 @@
-"""Shadow tracking — hypothetical tracking of rejected/expired trades."""
+"""Shadow tracking — hypothetical tracking of rejected/expired trades.
+
+Shadow trades are created when a recommendation is REJECTED or EXPIRED.
+Every scheduler tick (when a shadow is open), we record what would have
+happened to the position if the trader had taken it.
+
+The scheduler handles EOD via eod.py -> finalize_all_shadows().
+This module only handles intra-day snap recording and SL/target close.
+"""
 import duckdb
 import sqlite3
 from loguru import logger
@@ -14,7 +22,7 @@ def track_shadow_positions(
     trade_date: str,
     snap_time:  str,
 ) -> None:
-    """For every REJECTED or EXPIRED trade, track what would have happened."""
+    """Record a snap for every active shadow and auto-close on SL/target hit."""
     shadows = shadow.get_active_shadows(jconn, trade_date)
     for s in shadows:
         current = _fetch_strike_current(
@@ -38,20 +46,34 @@ def track_shadow_positions(
             "hit_target": int(hit_tgt),
         })
 
-        if hit_sl or hit_tgt or snap_time == settings.EOD_SWEEP_TIME:
+        # Close shadow if SL or target is hit intra-day.
+        # EOD close is handled by finalize_all_shadows() in eod.py
+        # (called by scheduler before this function runs).
+        if hit_sl or hit_tgt:
             outcome = _classify_shadow_outcome(pnl)
             shadow.close_shadow(jconn, s["id"], {
                 "final_pnl_pct": pnl,
                 "outcome":       outcome,
                 "closed_snap":   snap_time,
             })
+            logger.debug(
+                "Shadow {} closed intra-day: outcome={} pnl={:+.1f}%",
+                s["id"], outcome, pnl
+            )
 
 
 def _classify_shadow_outcome(pnl_pct: float) -> str:
+    """Classify the hypothetical trade outcome for learning analysis.
+
+    CLEAN_MISS  : would have won ≥30%  — costly rejection
+    GOOD_SKIP   : would have lost ≥20% — correct rejection
+    BREAK_EVEN  : |PnL| < 5%
+    RISKY_MISS  : everything else (mixed / moderate outcome)
+    """
     if pnl_pct > 30:
         return ShadowOutcome.CLEAN_MISS.value
-    elif pnl_pct < -20:
+    if pnl_pct < -20:
         return ShadowOutcome.GOOD_SKIP.value
-    elif abs(pnl_pct) < 5:
+    if abs(pnl_pct) < 5:
         return ShadowOutcome.BREAK_EVEN.value
     return ShadowOutcome.RISKY_MISS.value
