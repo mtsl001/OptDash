@@ -4,14 +4,14 @@ from optdash.models import MarketSession
 
 
 def compute_confidence(
-    gate_score:     int,
+    gate_score:       int,
     direction_result: dict,
-    iv_data:        dict,
-    gex_data:       dict,
-    vex_data:       dict,
-    strike:         dict,
-    learning_stats: dict,
-    session:        MarketSession,
+    iv_data:          dict,
+    gex_data:         dict,
+    vex_data:         dict,
+    strike:           dict,
+    learning_stats:   dict,
+    session:          MarketSession,
 ) -> dict:
     """
     Bucket 1: Signal Alignment     (max 40 pts)
@@ -23,24 +23,27 @@ def compute_confidence(
     signal_count = len(direction_result.get("signals", []))
     direction    = direction_result.get("direction", "")
 
-    # Bucket 1
+    # Bucket 1: signal strength
     b1 = min(40, margin * 8 + signal_count * 2)
 
-    # Bucket 2
-    b2 = min(25, int((gate_score / settings.GATE_MAX_SCORE) * 30))
+    # Bucket 2: gate adequacy
+    b2 = min(25, int((gate_score / (settings.GATE_MAX_SCORE or 10)) * 30))
 
-    # Bucket 3
+    # Bucket 3: structural quality
+    # Guard ivp with explicit None check — ivp=0 is valid (historically cheapest IV)
+    # and must NOT be coerced to 100 via falsy `or` operator.
+    ivp_val = iv_data.get("ivp")
     b3 = 0
-    if (iv_data.get("ivp") or 100) < 50:          b3 += 6
-    if iv_data.get("shape") == "CONTANGO":          b3 += 4
-    if (strike.get("s_score") or 0) > 10:          b3 += 7
-    if gex_data.get("regime") == "NEGATIVE_TREND": b3 += 5
+    if (ivp_val if ivp_val is not None else 100) < 50: b3 += 6
+    if iv_data.get("shape") == "CONTANGO":              b3 += 4
+    if (strike.get("s_score") or 0) > 10:              b3 += 7
+    if gex_data.get("regime") == "NEGATIVE_TREND":     b3 += 5
     vex_sig = vex_data.get("vex_signal", "")
-    if vex_sig == "VEX_BULLISH" and direction == "CE": b3 += 3
-    if vex_sig == "VEX_BEARISH" and direction == "PE": b3 += 3
+    if vex_sig == "VEX_BULLISH" and direction == "CE":  b3 += 3
+    if vex_sig == "VEX_BEARISH" and direction == "PE":  b3 += 3
     b3 = min(25, b3)
 
-    # Bucket 4
+    # Bucket 4: historical performance
     win_rate = learning_stats.get("win_rate", 50) / 100
     b4 = min(10, int(win_rate * 12))
 
