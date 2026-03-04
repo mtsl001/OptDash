@@ -44,7 +44,7 @@ def generate_recommendation(
     if pending:
         return None
 
-    # ── Gather all inputs ──────────────────────────────────────────────────────
+    # ── Gather all inputs ───────────────────────────────────────────────────────────────
     gate      = get_environment_score(conn, trade_date, snap_time, underlying)
     session   = get_market_session(snap_time)
     dir_res   = get_directional_bias(conn, trade_date, snap_time, underlying)
@@ -65,7 +65,7 @@ def generate_recommendation(
 
     direction = dir_res["direction"]
 
-    # ── Best strike selection ───────────────────────────────────────────────────
+    # ── Best strike selection ───────────────────────────────────────────────────────────
     strike_list = get_strikes(
         conn, trade_date, snap_time, underlying, top_n=settings.SCREENER_TOP_N
     )
@@ -74,12 +74,21 @@ def generate_recommendation(
         return None
     strike = candidates[0]
 
-    # ── Learning context (session + direction specific win-rate) ───────────────
+    # Guard: zero or negative LTP means illiquid / expired strike — skip
+    entry_premium = strike.get("ltp") or 0
+    if entry_premium <= 0:
+        logger.warning(
+            "Zero LTP for {} {} {} — skipping recommendation",
+            underlying, direction, strike.get("strike_price")
+        )
+        return None
+
+    # ── Learning context (session + direction specific win-rate) ─────────────────
     learning = stats.get_session_stats(
         jconn, underlying=underlying, direction=direction, session=session
     )
 
-    # ── Confidence score ─────────────────────────────────────────────────────────
+    # ── Confidence score ─────────────────────────────────────────────────────────────────
     conf_result = compute_confidence(
         gate_score=gate["score"],
         direction_result=dir_res,
@@ -92,7 +101,7 @@ def generate_recommendation(
     )
     confidence = conf_result["confidence"]
 
-    # ── Pre-flight hard rules ────────────────────────────────────────────────────
+    # ── Pre-flight hard rules ───────────────────────────────────────────────────────────
     passed, failures = run_pre_flight(
         gate_score=gate["score"],
         confidence=confidence,
@@ -108,15 +117,14 @@ def generate_recommendation(
         )
         return None
 
-    # ── SL / Target ──────────────────────────────────────────────────────────────
-    entry_premium = strike["ltp"]
+    # ── SL / Target ───────────────────────────────────────────────────────────────────
     sl     = round(entry_premium * (1 - settings.AI_SL_PCT), 2)
     target = round(entry_premium * settings.AI_TARGET_MULT, 2)
 
-    # ── Quality grade ────────────────────────────────────────────────────────────
+    # ── Quality grade ──────────────────────────────────────────────────────────────────
     quality = compute_quality_score(strike, gate["score"], confidence)
 
-    # ── Narrative ───────────────────────────────────────────────────────────────
+    # ── Narrative ───────────────────────────────────────────────────────────────────
     narrative = build_narrative(
         direction=direction,
         gate_score=gate["score"],
@@ -129,7 +137,7 @@ def generate_recommendation(
         dealer_oclock=dealer_oc,
     )
 
-    # ── Write to journal ──────────────────────────────────────────────────────────
+    # ── Write to journal ─────────────────────────────────────────────────────────────────
     trade_id = trades.create_trade(jconn, {
         "trade_date":        trade_date,
         "snap_time":         snap_time,
@@ -148,7 +156,7 @@ def generate_recommendation(
         "direction_signals": json.dumps(dir_res["signals"]),
         "narrative":         narrative,
         "status":            TradeStatus.GENERATED.value,
-        "session":           session.value,          # stored for learning stats
+        "session":           session.value,
         "delta":             strike.get("delta"),
         "theta":             strike.get("theta"),
         "vega":              strike.get("vega"),
@@ -162,7 +170,7 @@ def generate_recommendation(
     logger.info(
         "Recommendation: {} {} {} @ {:.1f} | conf={}% gate={} session={}",
         underlying, direction, strike["strike_price"],
-        entry_premium, confidence, gate["score"], session.value
+        entry_premium, confidence, gate["score"], session.value,
     )
     return trades.get_trade(jconn, trade_id)
 
