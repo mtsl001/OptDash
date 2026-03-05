@@ -1,6 +1,6 @@
 """APScheduler — 5-min market tick pipeline."""
 import sqlite3
-from datetime import datetime, timedelta, date
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -10,6 +10,7 @@ from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
 
 from optdash.config import settings
+from optdash.pipeline.purge import purge_old_raw_parquets
 
 IST = ZoneInfo("Asia/Kolkata")
 _scheduler: BackgroundScheduler | None = None
@@ -22,31 +23,6 @@ def _is_market_hours(now: datetime) -> bool:
     open_h,  open_m  = map(int, settings.MARKET_OPEN.split(":"))
     close_h, close_m = map(int, settings.MARKET_CLOSE.split(":"))
     return time(open_h, open_m) <= t <= time(close_h, close_m)
-
-
-def _purge_old_raw_parquets(data_root: Path, retention_days: int) -> None:
-    """Delete raw Parquet files older than retention_days calendar days.
-
-    Scans data/raw/options/ and data/raw/futures/ for files whose stem
-    is an ISO date (YYYY-MM-DD).  Files with any other naming pattern are
-    skipped silently so we never accidentally delete non-data files.
-
-    Processed Parquets (data/processed/) are never touched; they serve
-    as the permanent audit trail for DuckDB analytics.
-    """
-    cutoff    = datetime.now(IST).date() - timedelta(days=retention_days)
-    raw_dirs  = [data_root / "raw" / "options", data_root / "raw" / "futures"]
-    for raw_dir in raw_dirs:
-        if not raw_dir.exists():
-            continue
-        for parquet_file in raw_dir.glob("*.parquet"):
-            try:
-                file_date = date.fromisoformat(parquet_file.stem)  # YYYY-MM-DD
-                if file_date < cutoff:
-                    parquet_file.unlink()
-                    logger.info("[Purge] Deleted stale raw Parquet: {}", parquet_file)
-            except ValueError:
-                pass  # Non-date filename — skip silently
 
 
 def _run_tick(
@@ -104,7 +80,7 @@ def _run_tick(
             logger.error("generate_recommendation failed for {}: {}", underlying, e)
 
     # Step 5: EOD sweeps — fire exactly ONCE at the designated snap.
-    # Using == (not >=) so these don’t repeat on every subsequent tick,
+    # Using == (not >=) so these don't repeat on every subsequent tick,
     # which would attempt to re-close already-CLOSED trades/shadows.
     if snap_time == settings.EOD_FORCE_CLOSE_TIME:
         try:
@@ -121,7 +97,7 @@ def _run_tick(
         # PIPELINE-004: Purge raw Parquet files outside the retention window.
         # Runs once per day at EOD sweep time after shadows are finalized.
         try:
-            _purge_old_raw_parquets(
+            purge_old_raw_parquets(
                 Path(settings.DATA_ROOT),
                 settings.RAW_PARQUET_RETENTION_DAYS,
             )

@@ -10,6 +10,7 @@ Tick structure (every SCHEDULER_INTERVAL_SECONDS, market hours only):
 import duckdb
 import sqlite3
 from datetime import date, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -20,6 +21,7 @@ from optdash.ai.recommender import generate_recommendation
 from optdash.ai.tracker import track_open_positions, expire_stale_recommendations
 from optdash.ai.shadow_tracker import track_shadow_positions
 from optdash.ai.eod import eod_force_close, finalize_all_shadows
+from optdash.pipeline.purge import purge_old_raw_parquets
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -97,6 +99,16 @@ def create_scheduler(
                 logger.info("Running EOD sweep for {}", trade_date)
                 eod_force_close(duck, jconn, trade_date)
                 finalize_all_shadows(duck, jconn, trade_date)
+
+                # PIPELINE-004: purge stale raw Parquets (once per day at EOD).
+                try:
+                    purge_old_raw_parquets(
+                        Path(settings.DATA_ROOT),
+                        settings.RAW_PARQUET_RETENTION_DAYS,
+                    )
+                except Exception as purge_err:
+                    logger.error("raw Parquet purge failed: {}", purge_err)
+
                 done_flags[trade_date] = True
                 return  # skip normal tick on EOD
 
