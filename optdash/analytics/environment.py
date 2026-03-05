@@ -21,7 +21,7 @@ def get_environment_score(
     11-point environment gate.
     Conditions 1-8: standard (1 pt each = 8 pts max).
     Condition 9:    VEX alignment ★★ (2 pts).
-    Condition 10:   Dealer O’Clock guard ★ (1 pt).
+    Condition 10:   Dealer O'Clock guard ★ (1 pt).
     Max = 11 pts.
     """
     try:
@@ -59,10 +59,14 @@ def get_environment_score(
         }
 
         # C3: Futures OBI (1 pt)
-        c3_met = fut_bs < settings.FUT_OBI_BEAR_THRESHOLD
+        # Threshold is per-underlying: illiquid indices have naturally wider OBI
+        # swings and need a looser filter to avoid never/always firing.
+        fut_obi_threshold = settings.FUT_OBI_BEAR_THRESHOLD.get(underlying, -0.20)
+        c3_met = fut_bs < fut_obi_threshold
         conditions["fut_bs_ratio"] = {
             "met": c3_met, "value": round(fut_bs, 4),
-            "points": 1, "note": f"Fut OBI = {fut_bs:.3f}"
+            "points": 1,
+            "note": f"Fut OBI = {fut_bs:.3f} (threshold {fut_obi_threshold:.2f})"
         }
 
         # C4: PCR divergence (1 pt)
@@ -118,13 +122,13 @@ def get_environment_score(
             "points": 2, "note": "VEX mechanical alignment ★★ (2 pts)"
         }
 
-        # C10: Not Dealer O’Clock on DTE=1 ★ (1 pt bonus if safe)
+        # C10: Not Dealer O'Clock on DTE=1 ★ (1 pt bonus if safe)
         c10_met = not dealer_oc
         conditions["not_charm_distortion"] = {
             "met": c10_met,
             "value": "SAFE" if c10_met else "DEALER_OCLOCK",
             "points": 1,
-            "note": "Dealer O’Clock guard ★"
+            "note": "Dealer O'Clock guard ★"
         }
 
         score   = min(

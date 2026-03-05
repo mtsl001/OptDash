@@ -1,8 +1,13 @@
 """VEX/CEX analytics — Vanna Exposure + Charm Exposure."""
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import duckdb
 from loguru import logger
 from optdash.config import settings
 from optdash.models import VexSignal, CexSignal
+
+IST = ZoneInfo("Asia/Kolkata")
 
 
 def get_vex_cex_current(conn: duckdb.DuckDBPyConnection, trade_date: str,
@@ -28,7 +33,7 @@ def get_vex_cex_current(conn: duckdb.DuckDBPyConnection, trade_date: str,
         vex_total = row[2] or 0
         cex_total = row[5] or 0
         dte       = row[7] or 7
-        dealer_oc = _is_dealer_oclock(snap_time, dte)
+        dealer_oc = _is_dealer_oclock(snap_time, dte, underlying)
         vex_signal = _classify_vex(vex_total)
         cex_signal = _classify_cex(cex_total)
         interp = _interpret(vex_signal, cex_signal, dealer_oc)
@@ -79,7 +84,7 @@ def _get_vex_cex_series(conn, trade_date, underlying) -> list[dict]:
         result = []
         for r in rows:
             vex, cex, dte = r[1] or 0, r[4] or 0, r[8] or 7
-            dealer_oc  = _is_dealer_oclock(r[0], dte)
+            dealer_oc  = _is_dealer_oclock(r[0], dte, underlying)
             result.append({
                 "snap_time": r[0],
                 "vex_total_M": round(vex, 2), "vex_ce_M": round(r[2] or 0, 2),
@@ -133,9 +138,27 @@ def _classify_cex(cex_total: float) -> str:
     return CexSignal.NEUTRAL.value
 
 
-def _is_dealer_oclock(snap_time: str, dte: int) -> bool:
-    """True when DTE=1 and time >= DEALER_OCLOCK_START."""
-    return dte <= settings.DEALER_OCLOCK_DTE and snap_time >= settings.DEALER_OCLOCK_START
+def _is_dealer_oclock(snap_time: str, dte: int, underlying: str) -> bool:
+    """True when DTE≤1, time ≥ DEALER_OCLOCK_START, AND today is the correct
+    weekly expiry weekday for this underlying.
+
+    Rationale: each underlying has a different expiry day —
+      FINNIFTY  → Tuesday   (weekday 1)
+      MIDCPNIFTY → Monday    (weekday 0)
+      NIFTYNXT50 → Friday    (weekday 4)
+      SENSEX    → Friday    (weekday 4)
+      NIFTY / BANKNIFTY → Thursday (weekday 3)  [default]
+
+    Applying a single Thursday-centric window to all underlyings causes
+    false O'Clock badges and corrupts Gate bonus points on non-Thursday days.
+    """
+    if dte > settings.DEALER_OCLOCK_DTE:
+        return False
+    if snap_time < settings.DEALER_OCLOCK_START:
+        return False
+    expected_weekday = settings.EXPIRY_WEEKDAY.get(underlying, 3)  # default Thursday
+    today_weekday    = datetime.now(IST).weekday()
+    return today_weekday == expected_weekday
 
 
 def _interpret(vex_signal: str, cex_signal: str, dealer_oc: bool) -> str:
