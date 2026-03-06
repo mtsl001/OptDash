@@ -112,8 +112,21 @@ class Settings(BaseSettings):
     }
 
     # -- IV
-    IV_LOOKBACK_DAYS:   int   = 252
-    IV_CRUSH_HIGH_VEGA: float = 50.0
+    IV_LOOKBACK_DAYS: int = 252
+    # IV crush HIGH severity Vega threshold -- per underlying.
+    # Unit: option price points per 1% IV change (confirmed from screener
+    # normalisation: vega / ltp / 0.50). NOT raw BSM decimal Vega.
+    # Calibrated against typical ATM Vega for near-expiry options:
+    #   NIFTY      ~8-15  pts (ATM, 3-7 DTE)   -> threshold 15
+    #   BANKNIFTY  ~30-70 pts (ATM, 5-10 DTE)  -> threshold 30
+    #   FINNIFTY   ~6-12  pts                   -> threshold 10
+    #   MIDCPNIFTY ~3-8   pts                   -> threshold  8
+    #   NIFTYNXT50 ~3-8   pts                   -> threshold  8
+    #   SENSEX     ~20-50 pts                   -> threshold 20
+    IV_CRUSH_HIGH_VEGA: dict = {
+        "NIFTY": 15.0, "BANKNIFTY": 30.0, "FINNIFTY": 10.0,
+        "MIDCPNIFTY": 8.0, "NIFTYNXT50": 8.0, "SENSEX": 20.0,
+    }
 
     # -- Strike Screener
     SCREENER_TOP_N:             int   = 20

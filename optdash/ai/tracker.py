@@ -1,4 +1,4 @@
-"""Live position tracking — called every scheduler tick."""
+"""Live position tracking -- called every scheduler tick."""
 import duckdb
 import sqlite3
 from loguru import logger
@@ -62,11 +62,14 @@ def track_open_positions(
         else:
             trail_sl = sl_adjusted
 
-        # IV crush
-        iv_change = iv - (trade["iv_at_entry"] or iv)
+        # IV crush -- resolve per-underlying Vega threshold from config dict.
+        # Vega is stored in option price points per 1% IV change; thresholds
+        # are calibrated per index (see IV_CRUSH_HIGH_VEGA in config.py).
+        iv_change    = iv - (trade["iv_at_entry"] or iv)
+        iv_crush_thr = settings.IV_CRUSH_HIGH_VEGA.get(underlying, 15.0)
         iv_crush = (
             IVCrushSeverity.HIGH.value
-            if iv_change < -3.0 and abs(vega or 0) > settings.IV_CRUSH_HIGH_VEGA
+            if iv_change < -3.0 and abs(vega or 0) > iv_crush_thr
             else IVCrushSeverity.LOW.value  if iv_change < -1.0
             else IVCrushSeverity.NONE.value
         )
