@@ -36,7 +36,10 @@ def compute_confidence(
     b3 = 0
     if (ivp_val if ivp_val is not None else 100) < 50: b3 += 6
     if iv_data.get("shape") == "CONTANGO":              b3 += 4
-    if (strike.get("s_score") or 0) > 10:              b3 += 7
+    # S_score threshold aligned with 0–150 scale (STAR_3 floor = 80).
+    # Previously 10 (bottom 7% of scale) — now 80 (top 47%) so structural
+    # quality points only fire for genuinely above-average strikes.
+    if (strike.get("s_score") or 0) > 80:              b3 += 7
     # NEGATIVE_TREND and POSITIVE_DECLINING are both directionally favourable
     # environments for options buyers — gamma wall is absent or weakening.
     gex_regime = gex_data.get("regime", "")
