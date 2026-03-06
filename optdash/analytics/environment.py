@@ -1,4 +1,4 @@
-"""11-point Environment Gate — GO / WAIT / NO_GO verdict."""
+"""11-point Environment Gate -- GO / WAIT / NO_GO verdict."""
 import duckdb
 from loguru import logger
 from optdash.config import settings
@@ -20,9 +20,12 @@ def get_environment_score(
     """
     11-point environment gate.
     Conditions 1-8: standard (1 pt each = 8 pts max).
-    Condition 9:    VEX alignment ★★ (2 pts).
-    Condition 10:   Dealer O'Clock guard ★ (1 pt).
+    Condition 9:    VEX alignment ** (2 pts) -- requires direction.
+    Condition 10:   Dealer O'Clock guard * (1 pt).
     Max = 11 pts.
+
+    direction must be 'CE' or 'PE'. If None, C9 does not fire (0 pts).
+    All production callers (recommender, tracker) always pass direction.
     """
     try:
         gex_data = get_net_gex(conn, trade_date, snap_time, underlying)
@@ -58,10 +61,10 @@ def get_environment_score(
             "points": 1, "note": f"V_CoC 15m = {vcoc:+.2f}"
         }
 
-        # C3: Futures OBI — strong directional conviction (1 pt)
+        # C3: Futures OBI -- strong directional conviction (1 pt)
         # OptDash is an options BUYING dashboard (CE and PE buyers).
         # C3 fires on EITHER strong bearish OR strong bullish institutional
-        # futures flow — symmetric thresholds ensure CE trades can also earn
+        # futures flow -- symmetric thresholds ensure CE trades can also earn
         # this point when buyers dominate the futures market.
         fut_obi_bear = settings.FUT_OBI_BEAR_THRESHOLD.get(underlying, -0.20)
         fut_obi_bull = abs(fut_obi_bear)
@@ -112,26 +115,29 @@ def get_environment_score(
             "points": 1, "note": f"Session = {session.value}"
         }
 
-        # C9: VEX aligned with direction ★★ (2 pts)
+        # C9: VEX aligned with direction ** (2 pts)
+        # Only fires when the caller explicitly provides direction ('CE' or 'PE').
+        # direction=None: C9 does NOT fire (c9_met stays False). This is
+        # intentional -- the VEX bonus must be earned against a known trade
+        # type. Removing the old 'direction is None' fallback prevents
+        # inflated gate scores from API callers that omit direction.
         c9_met = False
         if direction == "CE" and vex_total > 0:
             c9_met = True
         elif direction == "PE" and vex_total < 0:
             c9_met = True
-        elif direction is None and abs(vex_total) > 0:
-            c9_met = True
         conditions["vex_aligned"] = {
             "met": c9_met, "value": round(vex_total, 2),
-            "points": 2, "note": "VEX mechanical alignment ★★ (2 pts)"
+            "points": 2, "note": "VEX mechanical alignment ** (2 pts)"
         }
 
-        # C10: Not Dealer O'Clock on DTE=1 ★ (1 pt bonus if safe)
+        # C10: Not Dealer O'Clock on DTE=1 * (1 pt bonus if safe)
         c10_met = not dealer_oc
         conditions["not_charm_distortion"] = {
             "met": c10_met,
             "value": "SAFE" if c10_met else "DEALER_OCLOCK",
             "points": 1,
-            "note": "Dealer O'Clock guard ★"
+            "note": "Dealer O'Clock guard *"
         }
 
         score   = min(
