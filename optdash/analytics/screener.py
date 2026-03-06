@@ -26,13 +26,25 @@ def get_strikes(
     snap_time:  str,
     underlying: str,
     top_n:      int = 20,
+    direction:  str | None = None,
 ) -> list[dict]:
     """
     Return top_n strikes ranked by S_score.
     Filters: moneyness ≤5%, delta 0.10–0.50, liquidity_cr ≥0.5.
+
+    Fix-J: optional `direction` parameter ("CE" or "PE").
+      When provided, adds AND o.option_type = ? to the ranked CTE.
+      When omitted (None), both CE and PE are returned (backwards-compatible).
+
+      Direction filter is injected as a Python f-string clause with a
+      separate params list entry to avoid DuckDB nullable-param quirks.
     """
     try:
-        rows = conn.execute("""
+        # Fix-J: build optional direction filter in Python rather than
+        # relying on (? IS NULL OR ...) to sidestep DuckDB NULL param issues.
+        direction_clause = "AND o.option_type = ?" if direction else ""
+
+        rows = conn.execute(f"""
             WITH spot_cte AS (
                 SELECT AVG(spot) AS spot
                 FROM options_data
@@ -77,6 +89,7 @@ def get_strikes(
                   AND ABS(o.delta) BETWEEN ? AND ?
                   AND o.oi * o.ltp / 1e7 >= ?
                   AND o.ltp > 0
+                  {direction_clause}
             )
             SELECT *,
                 CASE
@@ -96,6 +109,8 @@ def get_strikes(
             settings.SCREENER_MAX_MONEYNESS_PCT,
             settings.SCREENER_MIN_DELTA, settings.SCREENER_MAX_DELTA,
             settings.SCREENER_MIN_LIQUIDITY_CR,
+            # Append direction only when filter is active
+            *([direction] if direction else []),
             settings.STAR_4_THRESHOLD, settings.STAR_3_THRESHOLD, settings.STAR_2_THRESHOLD,
             top_n,
         ]).fetchall()
