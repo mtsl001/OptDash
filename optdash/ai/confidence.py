@@ -1,6 +1,6 @@
 """Confidence scoring — four independent buckets, capped at 100."""
 from optdash.config import settings
-from optdash.models import MarketSession
+from optdash.models import MarketSession, GEXRegime
 
 
 def compute_confidence(
@@ -37,7 +37,11 @@ def compute_confidence(
     if (ivp_val if ivp_val is not None else 100) < 50: b3 += 6
     if iv_data.get("shape") == "CONTANGO":              b3 += 4
     if (strike.get("s_score") or 0) > 10:              b3 += 7
-    if gex_data.get("regime") == "NEGATIVE_TREND":     b3 += 5
+    # NEGATIVE_TREND and POSITIVE_DECLINING are both directionally favourable
+    # environments for options buyers — gamma wall is absent or weakening.
+    gex_regime = gex_data.get("regime", "")
+    if gex_regime in (GEXRegime.NEGATIVE_TREND.value, GEXRegime.POSITIVE_DECLINING.value):
+        b3 += 5
     vex_sig = vex_data.get("vex_signal", "")
     if vex_sig == "VEX_BULLISH" and direction == "CE":  b3 += 3
     if vex_sig == "VEX_BEARISH" and direction == "PE":  b3 += 3
