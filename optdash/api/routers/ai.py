@@ -1,4 +1,5 @@
 """AI endpoints — recommendation, accept/reject, position, journal, learning."""
+import json
 import sqlite3
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel
@@ -14,7 +15,7 @@ router = APIRouter()
 DEFAULT_UNDERLYING = "NIFTY"
 
 
-# ── Request schemas ─────────────────────────────────────────────────────────
+# ── Request schemas ───────────────────────────────────────────────────
 
 class AcceptRequest(BaseModel):
     trade_id:           int
@@ -34,6 +35,39 @@ class CloseRequest(BaseModel):
     snap_time:  str
 
 
+# ── Response helpers ───────────────────────────────────────────────────
+
+def _hydrate_trade(trade: dict | None) -> dict | None:
+    """Deserialize JSON-string fields in a raw journal trade dict.
+
+    Fix-I: recommender.py stores conf_buckets and direction_signals via
+    json.dumps() so they land in SQLite as text columns. Without this
+    step, API consumers receive raw string literals instead of structured
+    objects, requiring client-side double-parsing.
+
+    Fields deserialized:
+      conf_buckets      (str -> dict)  fallback: {}
+      direction_signals (str -> list)  fallback: []
+
+    All other fields are passed through unchanged. None input returns None.
+    """
+    if trade is None:
+        return None
+    result = dict(trade)
+    _JSON_FIELDS: dict[str, object] = {
+        "conf_buckets":      {},
+        "direction_signals": [],
+    }
+    for field, default in _JSON_FIELDS.items():
+        raw = result.get(field)
+        if isinstance(raw, str):
+            try:
+                result[field] = json.loads(raw)
+            except (ValueError, TypeError):
+                result[field] = default
+    return result
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────
 
 @router.get("/recommendation/latest")
@@ -44,7 +78,7 @@ def latest_recommendation(
     pending = trades.get_pending_trades(jconn, underlying=underlying)
     if not pending:
         return {"status": "NO_RECOMMENDATION"}
-    return pending[0]   # index 0 = most-recent (ORDER BY created_at DESC)
+    return _hydrate_trade(pending[0])   # index 0 = most-recent (ORDER BY created_at DESC)
 
 
 @router.get("/position/live")
@@ -55,7 +89,7 @@ def live_position(
     open_trades = trades.get_open_trades(jconn, underlying=underlying)
     if not open_trades:
         return {"status": "NO_POSITION"}
-    return open_trades[0]
+    return _hydrate_trade(open_trades[0])
 
 
 @router.get("/position/snaps/{trade_id}")
@@ -69,7 +103,7 @@ def position_snaps(
         raise HTTPException(404, "Trade not found")
     snap_list = snaps.get_snaps_for_trade(jconn, trade_id)
     return {
-        "trade":           trade,
+        "trade":           _hydrate_trade(trade),
         "snaps":           snap_list,
         "theta_sl_series": build_theta_sl_series(trade, snap_list),
     }
@@ -157,7 +191,7 @@ def close_position(
     trades.close_trade(jconn, req.trade_id, {
         "exit_premium":   req.exit_price,
         "exit_snap_time": req.snap_time,
-        "exit_reason":    ExitReason.MANUAL_EXIT.value,   # was "MANUAL_CLOSE" (invalid)
+        "exit_reason":    ExitReason.MANUAL_EXIT.value,
         "final_pnl_abs":  pnl_abs,
         "final_pnl_pct":  pnl_pct,
     })
@@ -172,10 +206,17 @@ def trade_history(
     status:     str | None = Query(None),
     jconn: sqlite3.Connection = Depends(get_journal),
 ):
-    return trades.get_trade_history(
+    result = trades.get_trade_history(
         jconn, page=page, per_page=per_page,
         underlying=underlying, status=status
     )
+    # Hydrate each trade row in the paginated result.
+    # get_trade_history returns a dict with a "trades" list key.
+    if isinstance(result, dict) and "trades" in result:
+        result["trades"] = [_hydrate_trade(t) for t in result["trades"]]
+    elif isinstance(result, list):
+        result = [_hydrate_trade(t) for t in result]
+    return result
 
 
 @router.get("/learning/report")
