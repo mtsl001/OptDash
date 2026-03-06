@@ -60,7 +60,12 @@ def compute_confidence(
     if session == MarketSession.MIDDAY_CHOP:
         raw -= settings.SESSION_MIDDAY_CONFIDENCE_PENALTY
     if session == MarketSession.CLOSING_CRUSH:
-        raw = min(raw, settings.SESSION_CLOSING_MIN_CONFIDENCE)
+        # Fix-D: SESSION_CLOSING_CONFIDENCE_CAP is an UPPER BOUND on confidence
+        # during the closing session. It prevents overconfident late entries
+        # when market micro-structure degrades after 14:30.
+        # It does NOT act as a minimum requirement -- use PREFLIGHT_MIN_CONFIDENCE
+        # to enforce a floor.
+        raw = min(raw, settings.SESSION_CLOSING_CONFIDENCE_CAP)
 
     confidence = max(0, min(100, raw))
 
