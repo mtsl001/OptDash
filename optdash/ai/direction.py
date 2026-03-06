@@ -45,10 +45,12 @@ def get_directional_bias(
                              "direction": Direction.PE.value, "value": vcoc})
 
         # ── Signal 2: Futures OBI (weight 2) ──────────────────────────────
-        if fobi < settings.FUT_OBI_BEAR_THRESHOLD:
+        # FUT_OBI_BEAR_THRESHOLD is a per-underlying dict — resolve before comparison.
+        fut_obi_thr = settings.FUT_OBI_BEAR_THRESHOLD.get(underlying, -0.20)
+        if fobi < fut_obi_thr:
             signals.append({"signal": "FUT_OBI_BEAR", "weight": 2,
                              "direction": Direction.PE.value, "value": fobi})
-        elif fobi > abs(settings.FUT_OBI_BEAR_THRESHOLD):
+        elif fobi > abs(fut_obi_thr):
             signals.append({"signal": "FUT_OBI_BULL", "weight": 2,
                              "direction": Direction.CE.value, "value": fobi})
 
