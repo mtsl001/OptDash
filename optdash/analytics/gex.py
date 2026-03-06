@@ -27,7 +27,7 @@ def get_net_gex(conn: duckdb.DuckDBPyConnection, trade_date: str, snap_time: str
         gex_far  = (row[3] or 0) / settings.GEX_SCALING
         peak     = _get_gex_peak(conn, trade_date, underlying)
         pct      = (abs(gex_all) / peak * 100) if peak else 100.0
-        regime   = GEXRegime.NEGATIVE_TREND if gex_all < 0 else GEXRegime.POSITIVE_CHOP
+        regime   = _classify_regime(gex_all, pct)
         return {
             "snap_time":   row[0],
             "gex_all_B":  round(gex_all, 3),
@@ -62,14 +62,15 @@ def get_gex_series(conn: duckdb.DuckDBPyConnection, trade_date: str,
         peak = max(abs(r[1] or 0) for r in rows) or 1.0
         result = []
         for r in rows:
-            gex    = r[1] or 0
-            regime = GEXRegime.NEGATIVE_TREND if gex < 0 else GEXRegime.POSITIVE_CHOP
+            gex         = r[1] or 0
+            pct_of_peak = round(abs(gex) / peak * 100, 1)
+            regime      = _classify_regime(gex, pct_of_peak)
             result.append({
                 "snap_time":   r[0],
                 "gex_all_B":  round(r[1] or 0, 3),
                 "gex_near_B": round(r[2] or 0, 3),
                 "gex_far_B":  round(r[3] or 0, 3),
-                "pct_of_peak": round(abs(gex) / peak * 100, 1),
+                "pct_of_peak": pct_of_peak,
                 "regime": regime.value,
             })
         return result
@@ -151,6 +152,22 @@ def get_max_pain(conn: duckdb.DuckDBPyConnection, trade_date: str, snap_time: st
     except Exception as e:
         logger.warning("get_max_pain error: {}", e)
         return {"max_pain": None, "distance_pct": None}
+
+
+def _classify_regime(gex: float, pct_of_peak: float) -> GEXRegime:
+    """Three-state GEX regime classification.
+
+    NEGATIVE_TREND:     gex < 0  (dealers net short gamma — trending market)
+    POSITIVE_DECLINING: gex > 0 but pct_of_peak ≤ GEX_DECLINE_THRESHOLD
+                        (gamma wall is weakening — directional move building)
+    POSITIVE_CHOP:      gex > 0 and pct_of_peak > GEX_DECLINE_THRESHOLD
+                        (strong gamma wall — mean-reversion / choppy)
+    """
+    if gex < 0:
+        return GEXRegime.NEGATIVE_TREND
+    if pct_of_peak <= settings.GEX_DECLINE_THRESHOLD * 100:
+        return GEXRegime.POSITIVE_DECLINING
+    return GEXRegime.POSITIVE_CHOP
 
 
 def _get_gex_peak(conn: duckdb.DuckDBPyConnection, trade_date: str,
