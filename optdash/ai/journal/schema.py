@@ -115,10 +115,44 @@ CREATE INDEX IF NOT EXISTS idx_shadow_date            ON shadow_trades(trade_dat
 CREATE INDEX IF NOT EXISTS idx_shadow_snaps_shadow_id ON shadow_snaps(shadow_id);
 """
 
+# ---------------------------------------------------------------------------
 # Additive-only migrations for existing databases.
-# SQLite raises OperationalError: "duplicate column name" on re-runs; we catch it.
+#
+# WHY THIS LIST EXISTS
+# --------------------
+# CREATE TABLE IF NOT EXISTS creates ALL columns for fresh installs.
+# Existing databases (created before a column was added) need ALTER TABLE.
+# SQLite raises OperationalError("duplicate column name") on re-runs;
+# _run_migrations() catches that silently so every entry is idempotent.
+#
+# RULES FOR ADDING NEW COLUMNS
+# ----------------------------
+# 1. Add the column to CREATE_TRADES above (for fresh installs).
+# 2. Add a corresponding ALTER TABLE line here (for existing databases).
+# 3. Never remove or reorder existing entries — they are idempotent no-ops
+#    on databases that already have the column.
+# ---------------------------------------------------------------------------
 _MIGRATIONS = [
-    "ALTER TABLE trades ADD COLUMN session TEXT",
+    # ── original column ────────────────────────────────────────────────────
+    "ALTER TABLE trades ADD COLUMN session            TEXT",
+
+    # ── columns added after initial schema release ─────────────────────────
+    # Fix-A: these columns were present in CREATE_TRADES DDL but missing
+    # from _MIGRATIONS, causing OperationalError on upgrade installs.
+    "ALTER TABLE trades ADD COLUMN actual_entry_price REAL",
+    "ALTER TABLE trades ADD COLUMN s_score            REAL",
+    "ALTER TABLE trades ADD COLUMN quality_grade      TEXT",
+    "ALTER TABLE trades ADD COLUMN direction_signals  TEXT",
+    "ALTER TABLE trades ADD COLUMN narrative          TEXT",
+    "ALTER TABLE trades ADD COLUMN rejection_reason   TEXT",
+    "ALTER TABLE trades ADD COLUMN rejection_note     TEXT",
+    "ALTER TABLE trades ADD COLUMN delta              REAL",
+    "ALTER TABLE trades ADD COLUMN theta              REAL",
+    "ALTER TABLE trades ADD COLUMN vega               REAL",
+    "ALTER TABLE trades ADD COLUMN gamma              REAL",
+    "ALTER TABLE trades ADD COLUMN iv_at_entry        REAL",
+    "ALTER TABLE trades ADD COLUMN spot_at_entry      REAL",
+    "ALTER TABLE trades ADD COLUMN conf_buckets       TEXT",
 ]
 
 
@@ -140,11 +174,15 @@ def init_db(conn) -> None:
 
 def _run_migrations(conn) -> None:
     """Apply ALTER TABLE migrations for existing databases.
-    Each migration is run once; duplicate-column errors are silently ignored.
+
+    Each migration is attempted once. Duplicate-column errors are silently
+    ignored — this makes every entry idempotent on any database state.
+    Other unexpected errors are also suppressed to avoid blocking startup;
+    they will surface as runtime errors on first use of the missing column.
     """
     for sql in _MIGRATIONS:
         try:
             conn.execute(sql)
             conn.commit()
         except Exception:
-            pass  # Column already exists — expected on re-runs
+            pass  # Column already exists (expected on re-runs) or other benign error

@@ -98,9 +98,21 @@ def update_status(
     status:       str,
     state_reason: str | None = None,
 ) -> None:
+    """Update trade status and optionally persist a state_reason.
+
+    COALESCE(?, rejection_reason) writes the new reason when provided,
+    and preserves the existing value when state_reason is None —
+    so a bare status update never clears a previously recorded reason.
+
+    Fix-H: previously state_reason was accepted but silently dropped.
+    """
     conn.execute(
-        "UPDATE trades SET status=?, updated_at=datetime('now') WHERE id=?",
-        [status, trade_id]
+        """UPDATE trades
+           SET status=?,
+               rejection_reason=COALESCE(?, rejection_reason),
+               updated_at=datetime('now')
+           WHERE id=?""",
+        [status, state_reason, trade_id],
     )
     conn.commit()
 
