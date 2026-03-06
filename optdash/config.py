@@ -82,14 +82,26 @@ class Settings(BaseSettings):
     COC_DISCOUNT_THRESHOLD:  float = -5.0
 
     # -- VEX / CEX
+    # VEX_BULL_THRESHOLD: global fallback for unknown underlyings only.
+    # For all known underlyings, VEX_THRESHOLDS takes precedence.
     VEX_BULL_THRESHOLD:  float = 0.0
+    # Per-underlying VEX magnitude thresholds (Rs M).
+    # Scaled to index liquidity: liquid large-caps (NIFTY/BANKNIFTY) need a
+    # higher bar to filter noise; illiquid underlyings need a lower bar.
+    # Fix-B: these were absent — classifiers used VEX_BULL_THRESHOLD=0.0
+    # for all underlyings, causing spurious signals on low-volume indices.
+    VEX_THRESHOLDS: dict = {
+        "NIFTY": 0.50, "BANKNIFTY": 0.50, "FINNIFTY": 0.25,
+        "MIDCPNIFTY": 0.15, "NIFTYNXT50": 0.15, "SENSEX": 0.25,
+    }
     CEX_STRONG_BID:      float = 20.0
     CEX_BID:             float = 5.0
     CEX_PRESSURE:        float = -20.0
     DEALER_OCLOCK_DTE:   int   = 1
     DEALER_OCLOCK_START: str   = "14:00"
     # Per-underlying CEX magnitude thresholds (Rs M) - scaled to index liquidity.
-    # Used for per-security charm/vanna signal classification.
+    # CEX_CHARM_THRESHOLD -> STRONG_CHARM_BID level (replaces global CEX_STRONG_BID).
+    # CEX_VANNA_THRESHOLD -> CHARM_BID mid-level   (replaces global CEX_BID).
     CEX_CHARM_THRESHOLD: dict = {
         "NIFTY": 20.0, "BANKNIFTY": 20.0, "FINNIFTY": 10.0,
         "MIDCPNIFTY": 5.0, "NIFTYNXT50": 5.0, "SENSEX": 10.0,
@@ -185,7 +197,13 @@ class Settings(BaseSettings):
     GATE_SUSTAINED_NO_GO_SNAPS: int   = 2      # Exit after 2 consecutive NO_GO snaps
 
     SESSION_MIDDAY_CONFIDENCE_PENALTY: int = 10
-    SESSION_CLOSING_MIN_CONFIDENCE:    int = 60
+    # Fix-D: renamed from SESSION_CLOSING_MIN_CONFIDENCE.
+    # This is a CAP (upper bound), not a floor. During CLOSING_CRUSH session,
+    # confidence is capped at this value to prevent overconfident late entries.
+    # Setting it to a high number (e.g. 80) does NOT require high confidence
+    # -- it merely stops the cap from biting. To require high confidence,
+    # use PREFLIGHT_MIN_CONFIDENCE instead.
+    SESSION_CLOSING_CONFIDENCE_CAP: int = 60
 
 
 settings = Settings()

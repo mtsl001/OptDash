@@ -1,4 +1,11 @@
-"""VEX/CEX analytics — Vanna Exposure + Charm Exposure."""
+"""VEX/CEX analytics — Vanna Exposure + Charm Exposure.
+
+Classifier parameter change (Fix-B):
+  _classify_vex(vex_total, underlying) and
+  _classify_cex(cex_total, underlying) now look up per-underlying
+  thresholds from VEX_THRESHOLDS / CEX_CHARM_THRESHOLD / CEX_VANNA_THRESHOLD
+  in config, instead of using global scalar constants for all indices.
+"""
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -33,10 +40,10 @@ def get_vex_cex_current(conn: duckdb.DuckDBPyConnection, trade_date: str,
         vex_total = row[2] or 0
         cex_total = row[5] or 0
         dte       = row[7] or 7
-        dealer_oc = _is_dealer_oclock(snap_time, dte, underlying)
-        vex_signal = _classify_vex(vex_total)
-        cex_signal = _classify_cex(cex_total)
-        interp = _interpret(vex_signal, cex_signal, dealer_oc)
+        dealer_oc  = _is_dealer_oclock(snap_time, dte, underlying)
+        vex_signal = _classify_vex(vex_total, underlying)
+        cex_signal = _classify_cex(cex_total, underlying)
+        interp     = _interpret(vex_signal, cex_signal, dealer_oc)
         return {
             "snap_time": snap_time,
             "vex_ce_M": round(row[0] or 0, 2), "vex_pe_M": round(row[1] or 0, 2),
@@ -85,14 +92,18 @@ def _get_vex_cex_series(conn, trade_date, underlying) -> list[dict]:
         for r in rows:
             vex, cex, dte = r[1] or 0, r[4] or 0, r[8] or 7
             dealer_oc  = _is_dealer_oclock(r[0], dte, underlying)
+            # Pass underlying so per-underlying thresholds are applied
+            # consistently across the series (not just the current snap).
+            vex_sig = _classify_vex(vex, underlying)
+            cex_sig = _classify_cex(cex, underlying)
             result.append({
                 "snap_time": r[0],
                 "vex_total_M": round(vex, 2), "vex_ce_M": round(r[2] or 0, 2),
                 "vex_pe_M": round(r[3] or 0, 2), "cex_total_M": round(cex, 2),
                 "cex_ce_M": round(r[5] or 0, 2), "cex_pe_M": round(r[6] or 0, 2),
                 "spot": r[7], "dte": dte, "dealer_oclock": dealer_oc,
-                "vex_signal": _classify_vex(vex), "cex_signal": _classify_cex(cex),
-                "interpretation": _interpret(_classify_vex(vex), _classify_cex(cex), dealer_oc),
+                "vex_signal": vex_sig, "cex_signal": cex_sig,
+                "interpretation": _interpret(vex_sig, cex_sig, dealer_oc),
             })
         return result
     except Exception as e:
@@ -122,32 +133,64 @@ def _get_by_strike(conn, trade_date, snap_time, underlying) -> list[dict]:
         return []
 
 
-def _classify_vex(vex_total: float) -> str:
-    return VexSignal.VEX_BULLISH.value if vex_total > settings.VEX_BULL_THRESHOLD \
-        else VexSignal.VEX_BEARISH.value if vex_total < 0 \
-        else VexSignal.NEUTRAL.value
+def _classify_vex(vex_total: float, underlying: str = "") -> str:
+    """Classify VEX signal using per-underlying threshold.
+
+    Threshold lookup order:
+      1. VEX_THRESHOLDS[underlying]   (per-underlying, primary)
+      2. VEX_BULL_THRESHOLD           (global fallback for unknown underlyings)
+
+    Threshold is now applied symmetrically:
+      > +threshold -> VEX_BULLISH
+      < -threshold -> VEX_BEARISH
+      otherwise   -> NEUTRAL
+
+    Fix-B: previously VEX_BULL_THRESHOLD was 0.0 for all underlyings,
+    causing any non-zero VEX to fire a directional signal (pure noise).
+    """
+    threshold = settings.VEX_THRESHOLDS.get(underlying, settings.VEX_BULL_THRESHOLD)
+    if vex_total > threshold:
+        return VexSignal.VEX_BULLISH.value
+    if vex_total < -threshold:
+        return VexSignal.VEX_BEARISH.value
+    return VexSignal.NEUTRAL.value
 
 
-def _classify_cex(cex_total: float) -> str:
-    if cex_total >= settings.CEX_STRONG_BID:
+def _classify_cex(cex_total: float, underlying: str = "") -> str:
+    """Classify CEX signal using per-underlying thresholds.
+
+    Level mapping:
+      strong_thr  <- CEX_CHARM_THRESHOLD[underlying]  -> STRONG_CHARM_BID
+      bid_thr     <- CEX_VANNA_THRESHOLD[underlying]  -> CHARM_BID
+      -strong_thr                                     -> CHARM_PRESSURE (symmetric)
+
+    Fix-B: previously used global scalars CEX_STRONG_BID=20.0 and CEX_BID=5.0
+    for all underlyings. MIDCPNIFTY and NIFTYNXT50 have ~10x lower CEX
+    magnitudes than BANKNIFTY, so they never crossed the global thresholds.
+    """
+    strong_thr   = settings.CEX_CHARM_THRESHOLD.get(underlying, settings.CEX_STRONG_BID)
+    bid_thr      = settings.CEX_VANNA_THRESHOLD.get(underlying, settings.CEX_BID)
+    pressure_thr = -strong_thr  # symmetric negative
+
+    if cex_total >= strong_thr:
         return CexSignal.STRONG_CHARM_BID.value
-    if cex_total >= settings.CEX_BID:
+    if cex_total >= bid_thr:
         return CexSignal.CHARM_BID.value
-    if cex_total <= settings.CEX_PRESSURE:
+    if cex_total <= pressure_thr:
         return CexSignal.CHARM_PRESSURE.value
     return CexSignal.NEUTRAL.value
 
 
 def _is_dealer_oclock(snap_time: str, dte: int, underlying: str) -> bool:
-    """True when DTE≤1, time ≥ DEALER_OCLOCK_START, AND today is the correct
+    """True when DTE<=1, time >= DEALER_OCLOCK_START, AND today is the correct
     weekly expiry weekday for this underlying.
 
-    Rationale: each underlying has a different expiry day —
-      FINNIFTY  → Tuesday   (weekday 1)
-      MIDCPNIFTY → Monday    (weekday 0)
-      NIFTYNXT50 → Friday    (weekday 4)
-      SENSEX    → Friday    (weekday 4)
-      NIFTY / BANKNIFTY → Thursday (weekday 3)  [default]
+    Rationale: each underlying has a different expiry day --
+      FINNIFTY  -> Tuesday   (weekday 1)
+      MIDCPNIFTY -> Monday    (weekday 0)
+      NIFTYNXT50 -> Friday    (weekday 4)
+      SENSEX    -> Friday    (weekday 4)
+      NIFTY / BANKNIFTY -> Thursday (weekday 3)  [default]
 
     Applying a single Thursday-centric window to all underlyings causes
     false O'Clock badges and corrupts Gate bonus points on non-Thursday days.
