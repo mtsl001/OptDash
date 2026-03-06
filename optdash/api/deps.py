@@ -1,10 +1,18 @@
-"""Shared FastAPI dependencies — DuckDB + SQLite connection management.
+"""Shared FastAPI dependencies -- DuckDB + SQLite connection management.
 
-DuckDB strategy:
-  The in-process :memory: connection (with live Parquet views) is created by
-  duckdb_gateway.startup() during the app lifespan — BEFORE this startup() runs.
-  We reuse that same connection here so the API and the scheduler always read
-  from the same live Parquet dataset rather than a separate stale .duckdb file.
+DuckDB lifecycle
+----------------
+deps.startup() owns the FULL DuckDB lifecycle:
+  1. Calls duckdb_gateway.startup() -- creates the in-process :memory:
+     connection and registers the rolling processed/ Parquet view.
+  2. Stores the returned connection on app.state.duck so all API routers
+     receive it via Depends(get_duck).
+  3. deps.shutdown() calls duckdb_gateway.shutdown() to close the
+     connection cleanly before the process exits.
+
+This means both the full-stack run (run_api.py) and the standalone DB-only
+mode (uvicorn optdash.api.app:app) work correctly without any extra DuckDB
+wiring in the entry points -- the lifespan just calls deps.startup/shutdown.
 """
 import sqlite3
 from fastapi import FastAPI, Request
@@ -12,16 +20,20 @@ from loguru import logger
 
 from optdash.config import settings
 from optdash.ai.journal.schema import init_db
-from optdash.pipeline.duckdb_gateway import get_conn as get_duck_conn
+from optdash.pipeline.duckdb_gateway import (
+    startup  as duck_startup,
+    shutdown as duck_shutdown,
+    get_conn as get_duck_conn,  # noqa: F401  (kept for external callers)
+)
 
 
 async def startup(app: FastAPI) -> None:
-    """Wire the shared DuckDB gateway connection + open SQLite journal."""
-    # Reuse the in-process :memory: connection created by duckdb_gateway.startup().
-    # This ensures /market/* API endpoints read the same live Parquet views
-    # that the scheduler analytics use — no separate stale .duckdb file.
-    app.state.duck = get_duck_conn()
-    logger.info("DuckDB API dependency wired to gateway in-memory connection.")
+    """Initialise DuckDB gateway and open SQLite journal."""
+    # Start the in-process DuckDB connection and register the rolling
+    # Parquet view.  Must happen first -- all API endpoints depend on it.
+    duck_conn      = duck_startup()
+    app.state.duck = duck_conn
+    logger.info("DuckDB gateway initialised -- in-memory connection ready.")
 
     logger.info("Connecting SQLite journal: {}", settings.JOURNAL_DB_PATH)
     jconn = sqlite3.connect(str(settings.JOURNAL_DB_PATH), check_same_thread=False)
@@ -29,7 +41,7 @@ async def startup(app: FastAPI) -> None:
 
     # WAL mode: allows concurrent reads+writes without exclusive locking.
     # The scheduler writes position_snaps every 5 min while the API handles
-    # accept/reject requests — both need simultaneous write access.
+    # accept/reject requests -- both need simultaneous write access.
     jconn.execute("PRAGMA journal_mode=WAL")
     jconn.execute("PRAGMA synchronous=NORMAL")  # safe with WAL, ~3x faster writes
     jconn.execute("PRAGMA foreign_keys=ON")      # enforce referential integrity
@@ -40,7 +52,8 @@ async def startup(app: FastAPI) -> None:
 
 
 async def shutdown(app: FastAPI) -> None:
-    """Close SQLite journal. DuckDB lifecycle managed by duckdb_gateway.shutdown()."""
+    """Close DuckDB connection and SQLite journal."""
+    duck_shutdown()
     try:
         app.state.journal.close()
     except Exception:

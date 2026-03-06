@@ -1,13 +1,25 @@
-"""APScheduler — drives recommendation generation and position tracking.
+"""APScheduler -- drives recommendation generation and position tracking.
 
 Tick structure (every SCHEDULER_INTERVAL_SECONDS, market hours only):
-  1. Expire stale pending recommendations  → once per tick (all underlyings)
-  2. Generate recommendations              → once per underlying
-  3. Track open positions                  → once per tick (all open trades)
-  4. Track shadow positions                → once per tick (all shadow trades)
-  5. EOD sweep                             → once per calendar day
+  1. Expire stale pending recommendations  -> once per tick (all underlyings)
+  2. Generate recommendations              -> once per underlying
+  3. Track open positions                  -> once per tick (all open trades)
+  4. Track shadow positions                -> once per tick (all shadow trades)
+  5. EOD sweep                             -> once per calendar day
+
+DuckDB connection
+-----------------
+The scheduler reuses the shared in-process DuckDB gateway connection via
+duckdb_gateway.get_conn().  The old pattern (duckdb.connect(duck_path,
+read_only=True) per tick) opened a file-based connection that had no
+options_data Parquet view registered, causing every analytics call to fail
+silently with 'Table options_data not found'.
+
+Both API request handlers and the scheduler run in the same asyncio event
+loop (AsyncIOScheduler).  Because all DuckDB calls are synchronous and
+never yield to the event loop, each tick runs atomically -- no concurrent
+DuckDB access is possible.
 """
-import duckdb
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
@@ -22,6 +34,7 @@ from optdash.ai.tracker import track_open_positions, expire_stale_recommendation
 from optdash.ai.shadow_tracker import track_shadow_positions
 from optdash.ai.eod import eod_force_close, finalize_all_shadows
 from optdash.pipeline.purge import purge_old_raw_parquets
+from optdash.pipeline.duckdb_gateway import get_conn, refresh_views
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -68,12 +81,16 @@ def _make_jconn(journal_path) -> sqlite3.Connection:
 
 
 def create_scheduler(
-    duck_path:    str,
     journal_path: str,
 ) -> AsyncIOScheduler:
     """
     Returns a configured AsyncIOScheduler.
-    Call scheduler.start() inside FastAPI lifespan (after startup()).
+    Call scheduler.start() inside FastAPI lifespan (after deps.startup()).
+
+    Note: duck_path removed -- the scheduler now uses the shared DuckDB
+    gateway connection (get_conn()) so it reads the same registered
+    Parquet view as the API.  duckdb_gateway.startup() must be called
+    first -- deps.startup() does this automatically.
     """
     done_flags: dict[str, bool] = {}
 
@@ -84,15 +101,11 @@ def create_scheduler(
         trade_date = _today_str()
         snap_time  = _snap_time_str()
 
-        # Guard uninitialized variables so finally block is always safe
-        duck  = None
         jconn = None
-
         try:
-            duck  = duckdb.connect(str(duck_path), read_only=True)
+            # Shared in-process DuckDB -- gateway owns its lifecycle.
+            duck  = get_conn()
             jconn = _make_jconn(journal_path)
-            # Tables are guaranteed to exist: init_db() ran in startup() before
-            # the scheduler was started (see run_api.py lifespan order).
 
             # ── EOD sweep (once per calendar day) ─────────────────────────────
             if _is_eod() and not _eod_done_today(done_flags):
@@ -100,7 +113,7 @@ def create_scheduler(
                 eod_force_close(duck, jconn, trade_date)
                 finalize_all_shadows(duck, jconn, trade_date)
 
-                # PIPELINE-004: purge stale raw Parquets (once per day at EOD).
+                # Purge stale raw Parquets (once per day at EOD).
                 try:
                     purge_old_raw_parquets(
                         Path(settings.DATA_ROOT),
@@ -109,13 +122,21 @@ def create_scheduler(
                 except Exception as purge_err:
                     logger.error("raw Parquet purge failed: {}", purge_err)
 
+                # Roll the DuckDB view forward so tomorrow's new partition
+                # directory is visible on the first tick after midnight.
+                try:
+                    refresh_views(duck)
+                    logger.info("DuckDB view refreshed for next trading day.")
+                except Exception as rv_err:
+                    logger.error("refresh_views failed: {}", rv_err)
+
                 done_flags[trade_date] = True
                 return  # skip normal tick on EOD
 
-            # ── Step 1: Expire stale pending recommendations (all underlyings) ──
+            # ── Step 1: Expire stale pending recommendations ───────────────────
             expire_stale_recommendations(jconn, trade_date, snap_time)
 
-            # ── Step 2: Generate new recommendations (per underlying) ─────────
+            # ── Step 2: Generate new recommendations (per underlying) ──────────
             for underlying in settings.UNDERLYINGS:
                 rec = generate_recommendation(
                     duck, jconn, trade_date, snap_time, underlying
@@ -129,20 +150,15 @@ def create_scheduler(
                         rec.get("strike_price"),
                     )
 
-            # ── Step 3: Track all open positions (once, not per-underlying) ────
+            # ── Step 3: Track all open positions (once, not per-underlying) ─────
             track_open_positions(duck, jconn, trade_date, snap_time)
 
-            # ── Step 4: Track all shadow positions (once) ─────────────────
+            # ── Step 4: Track all shadow positions (once) ──────────────────────
             track_shadow_positions(duck, jconn, trade_date, snap_time)
 
         except Exception as e:
             logger.error("Scheduler tick error @ {}: {}", snap_time, e)
         finally:
-            if duck:
-                try:
-                    duck.close()
-                except Exception:
-                    pass
             if jconn:
                 try:
                     jconn.close()
