@@ -58,15 +58,18 @@ def get_environment_score(
             "points": 1, "note": f"V_CoC 15m = {vcoc:+.2f}"
         }
 
-        # C3: Futures OBI (1 pt)
-        # Threshold is per-underlying: illiquid indices have naturally wider OBI
-        # swings and need a looser filter to avoid never/always firing.
-        fut_obi_threshold = settings.FUT_OBI_BEAR_THRESHOLD.get(underlying, -0.20)
-        c3_met = fut_bs < fut_obi_threshold
+        # C3: Futures OBI — strong directional conviction (1 pt)
+        # OptDash is an options BUYING dashboard (CE and PE buyers).
+        # C3 fires on EITHER strong bearish OR strong bullish institutional
+        # futures flow — symmetric thresholds ensure CE trades can also earn
+        # this point when buyers dominate the futures market.
+        fut_obi_bear = settings.FUT_OBI_BEAR_THRESHOLD.get(underlying, -0.20)
+        fut_obi_bull = abs(fut_obi_bear)
+        c3_met = fut_bs < fut_obi_bear or fut_bs > fut_obi_bull
         conditions["fut_bs_ratio"] = {
             "met": c3_met, "value": round(fut_bs, 4),
             "points": 1,
-            "note": f"Fut OBI = {fut_bs:.3f} (threshold {fut_obi_threshold:.2f})"
+            "note": f"Fut OBI = {fut_bs:.3f} (bear<{fut_obi_bear:.2f} | bull>{fut_obi_bull:.2f})"
         }
 
         # C4: PCR divergence (1 pt)
