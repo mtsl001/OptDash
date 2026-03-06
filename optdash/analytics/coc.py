@@ -113,15 +113,31 @@ def get_futures_obi(conn: duckdb.DuckDBPyConnection, trade_date: str,
 
 def _compute_vcoc(conn: duckdb.DuckDBPyConnection, trade_date: str,
                   snap_time: str, underlying: str) -> float:
-    """V_CoC 15-min velocity — difference in CoC over last 3 snaps (~15 min)."""
+    """V_CoC 15-min velocity — CoC diff over a true 15-minute time window.
+
+    Computes a Python-side HH:MM cutoff (snap_time minus 15 minutes) and
+    filters the DB query by snap_time >= cutoff.  This guarantees the
+    window is always anchored to wall-clock time: if a 5-min snap is
+    missed (feed gap, broker outage, restart), the query still returns
+    only rows that fall within the genuine 15-min boundary rather than
+    silently extending the window to 20-25 min (the old LIMIT 4 flaw).
+
+    Returns 0.0 if fewer than 2 snaps exist in the window (e.g. early
+    morning or very sparse data) — same safe default as before.
+    """
     try:
+        h, m       = map(int, snap_time.split(":"))
+        total_min  = h * 60 + m - 15
+        if total_min < 0:
+            return 0.0
+        cutoff = f"{total_min // 60:02d}:{total_min % 60:02d}"
         rows = conn.execute("""
             SELECT snap_time, AVG(fut_price) - AVG(spot) AS coc
             FROM options_data
             WHERE trade_date=? AND underlying=? AND instrument_type='FUT'
-              AND snap_time <= ?
-            GROUP BY snap_time ORDER BY snap_time DESC LIMIT 4
-        """, [trade_date, underlying, snap_time]).fetchall()
+              AND snap_time <= ? AND snap_time >= ?
+            GROUP BY snap_time ORDER BY snap_time DESC
+        """, [trade_date, underlying, snap_time, cutoff]).fetchall()
         if len(rows) < 2:
             return 0.0
         return round((rows[0][1] or 0) - (rows[-1][1] or 0), 2)
@@ -130,7 +146,13 @@ def _compute_vcoc(conn: duckdb.DuckDBPyConnection, trade_date: str,
 
 
 def _compute_vcoc_from_series(rows: list, i: int) -> float:
-    """V_CoC from pre-fetched series (used in get_coc_series)."""
+    """V_CoC from pre-fetched series (used in get_coc_series).
+
+    Uses index-3 (3 rows back = 15 min at 5-min cadence) for performance;
+    feed-gap risk does not apply here because the series is fetched in one
+    query over the complete day — any gap in the source data produces a
+    gap entry in `rows` itself, which the caller can filter if needed.
+    """
     if i < 3:
         return 0.0
     return round((rows[i][1] or 0) - (rows[i - 3][1] or 0), 2)
