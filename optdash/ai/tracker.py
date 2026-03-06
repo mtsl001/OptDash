@@ -170,12 +170,25 @@ def expire_stale_recommendations(
 def _fetch_strike_current(
     conn, trade_date, snap_time, underlying, strike_price, expiry, option_type
 ) -> dict | None:
+    """Fetch the most-recent options row at or before snap_time for the given contract.
+
+    Fix-C: changed from exact snap_time=? to snap_time<=? with
+    ORDER BY snap_time DESC LIMIT 1.
+
+    Rationale: during EOD force-close (15:20-15:25) the scheduler may request
+    a snap that has not yet been committed to DuckDB due to BQ feed latency.
+    An exact match returns None in that window, causing tracker/eod.py to fall
+    back to pnl=0 and write a phantom zero-PnL closure in the journal.
+    The <= query always returns the last known LTP for the contract, so exit
+    premium and PnL are always based on real market data.
+    """
     try:
         row = conn.execute("""
             SELECT ltp, iv, delta, theta, gamma, vega, spot
             FROM options_data
-            WHERE trade_date=? AND snap_time=? AND underlying=?
+            WHERE trade_date=? AND snap_time<=? AND underlying=?
               AND strike_price=? AND expiry_date=? AND option_type=?
+            ORDER BY snap_time DESC
             LIMIT 1
         """, [trade_date, snap_time, underlying,
                strike_price, expiry, option_type]).fetchone()
