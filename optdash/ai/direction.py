@@ -123,30 +123,63 @@ def _is_vcoc_spike_active(
     snap_time:  str,
     underlying: str,
 ) -> bool:
-    """
-    True if a V_CoC spike occurred within the last VCOC_SPIKE_EXPIRY_SNAPS snaps.
-    Fetches the N most-recent distinct snap_times, then checks V_CoC for each.
-    This correctly scopes memory to a rolling window rather than all-day history.
+    """True if any of the last VCOC_SPIKE_EXPIRY_SNAPS snaps had a V_CoC spike.
+
+    Fix-F: replaced N+1 query pattern with a single batch fetch.
+
+    Algorithm:
+      1. Compute the earliest snap we could need as a V_CoC lookback anchor:
+           earliest = snap_time - (N * 5 min) - 15 min
+      2. Fetch all CoC values (fut_price - spot) in [earliest, snap_time]
+         in one query, sorted ASC.
+      3. For each of the N most-recent target snaps (in-memory slice),
+         find the oldest snap in its [t-15min, t) window (the anchor),
+         compute vcoc = |coc(t) - coc(anchor)|.
+      4. Return True on the first snap where vcoc > VCOC_BULL_THRESHOLD.
+
+    Query cost: 1 (was 1 + 2N = 7 for N=3; 85% reduction per underlying).
     """
     try:
-        snap_rows = conn.execute("""
-            SELECT DISTINCT snap_time FROM options_data
-            WHERE trade_date=? AND underlying=? AND snap_time<=?
-            ORDER BY snap_time DESC
-            LIMIT ?
-        """, [
-            trade_date, underlying, snap_time,
-            settings.VCOC_SPIKE_EXPIRY_SNAPS,
-        ]).fetchall()
+        n         = settings.VCOC_SPIKE_EXPIRY_SNAPS
+        threshold = abs(settings.VCOC_BULL_THRESHOLD)
 
-        if not snap_rows:
+        # Compute earliest minute we need for any 15-min lookback anchor
+        h, m         = map(int, snap_time.split(":"))
+        earliest_min = max(0, h * 60 + m - n * 5 - 15)
+        cutoff       = f"{earliest_min // 60:02d}:{earliest_min % 60:02d}"
+
+        rows = conn.execute("""
+            SELECT snap_time, AVG(fut_price) - AVG(spot) AS coc
+            FROM options_data
+            WHERE trade_date=? AND underlying=? AND instrument_type='FUT'
+              AND snap_time <= ? AND snap_time >= ?
+            GROUP BY snap_time ORDER BY snap_time ASC
+        """, [trade_date, underlying, snap_time, cutoff]).fetchall()
+
+        if len(rows) < 2:
             return False
 
-        threshold = abs(settings.VCOC_BULL_THRESHOLD)
-        for (t,) in snap_rows:
-            coc = get_coc_latest(conn, trade_date, t, underlying)
-            if abs(coc.get("v_coc_15m", 0) or 0) > threshold:
+        coc_map    = {r[0]: (r[1] or 0.0) for r in rows}  # snap -> coc
+        all_times  = [r[0] for r in rows]                  # ASC sorted
+        # N most-recent target snaps are the last N items in the ASC list
+        target_snaps = all_times[-n:]
+
+        for t in reversed(target_snaps):   # most-recent first; exit early on spike
+            h2, m2 = map(int, t.split(":"))
+            t_min  = h2 * 60 + m2
+            if t_min < 15:
+                continue
+            window_cutoff = f"{(t_min - 15) // 60:02d}:{(t_min - 15) % 60:02d}"
+            # Oldest available snap inside the 15-min window before t
+            anchor = next(
+                (st for st in all_times if window_cutoff <= st < t),
+                None,
+            )
+            if anchor is None:
+                continue
+            if abs(coc_map[t] - coc_map[anchor]) > threshold:
                 return True
+
         return False
 
     except Exception:
