@@ -10,6 +10,8 @@ from optdash.models import Direction, TradeStatus
 from optdash.analytics.environment import get_environment_score, get_market_session
 from optdash.analytics.gex import get_net_gex, get_max_pain
 from optdash.analytics.iv import get_ivr_ivp
+# Fix-G: import retained as fallback for when direction.py returns no vex_data
+# (e.g. exception path). Primary path reads vex_data from dir_res["vex_data"].
 from optdash.analytics.vex_cex import get_vex_cex_current
 from optdash.analytics.screener import get_strikes
 from optdash.ai.direction import get_directional_bias
@@ -57,10 +59,16 @@ def generate_recommendation(
     # actual CE/PE trade direction, not whenever VEX is non-zero.
     gate = get_environment_score(conn, trade_date, snap_time, underlying, direction=direction)
 
-    # ── Step 3: Supporting analytics ─────────────────────────────────────────
+    # ── Step 3: Supporting analytics ──────────────────────────────────────────
     iv_data  = get_ivr_ivp(conn, trade_date, snap_time, underlying)
     gex_data = get_net_gex(conn, trade_date, snap_time, underlying)
-    vex_data = get_vex_cex_current(conn, trade_date, snap_time, underlying)
+    # Fix-G: get_directional_bias() already called get_vex_cex_current() internally
+    # and exposes the result in dir_res["vex_data"]. Read it directly to avoid a
+    # second identical DuckDB round-trip. The 'or' fallback handles the rare case
+    # where direction.py hit an exception before computing vex (error return omits
+    # the key), keeping correctness without coupling to direction.py internals.
+    vex_data = dir_res.get("vex_data") or \
+               get_vex_cex_current(conn, trade_date, snap_time, underlying)
 
     dealer_oc = vex_data.get("dealer_oclock", False)
 
@@ -70,7 +78,7 @@ def generate_recommendation(
         if nearest_expiry else {}
     )
 
-    # ── Best strike selection ─────────────────────────────────────────────
+    # ── Best strike selection ────────────────────────────────────────────────
     strike_list = get_strikes(
         conn, trade_date, snap_time, underlying, top_n=settings.SCREENER_TOP_N
     )
@@ -93,7 +101,7 @@ def generate_recommendation(
         jconn, underlying=underlying, direction=direction, session=session
     )
 
-    # ── Confidence score ─────────────────────────────────────────────────
+    # ── Confidence score ──────────────────────────────────────────────────
     conf_result = compute_confidence(
         gate_score=gate["score"],
         direction_result=dir_res,
@@ -106,7 +114,7 @@ def generate_recommendation(
     )
     confidence = conf_result["confidence"]
 
-    # ── Pre-flight hard rules ────────────────────────────────────────────
+    # ── Pre-flight hard rules ─────────────────────────────────────────────
     passed, failures = run_pre_flight(
         gate_score=gate["score"],
         confidence=confidence,
@@ -129,7 +137,7 @@ def generate_recommendation(
     # ── Quality grade ──────────────────────────────────────────────────
     quality = compute_quality_score(strike, gate["score"], confidence)
 
-    # ── Narrative ────────────────────────────────────────────────────────
+    # ── Narrative ─────────────────────────────────────────────────────────
     narrative = build_narrative(
         direction=direction,
         gate_score=gate["score"],
@@ -142,7 +150,7 @@ def generate_recommendation(
         dealer_oclock=dealer_oc,
     )
 
-    # ── Write to journal ───────────────────────────────────────────────────
+    # ── Write to journal ──────────────────────────────────────────────────────
     trade_id = trades.create_trade(jconn, {
         "trade_date":        trade_date,
         "snap_time":         snap_time,

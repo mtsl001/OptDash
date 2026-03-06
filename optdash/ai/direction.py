@@ -9,6 +9,10 @@ Signal weights:
 
 Max CE/PE weight = 9 (all signals same direction).
 Ties (ce_weight == pe_weight) yield NEUTRAL — no edge when signals cancel.
+
+Fix-G: get_directional_bias() now includes 'vex_data' in its return dict
+so callers (recommender.py) can read the already-computed VEX snapshot
+instead of issuing a second get_vex_cex_current() round-trip.
 """
 import duckdb
 from loguru import logger
@@ -90,7 +94,8 @@ def get_directional_bias(
         # No signals at all
         if ce_weight == 0 and pe_weight == 0:
             return {"direction": Direction.NEUTRAL.value, "ce_weight": 0,
-                    "pe_weight": 0, "margin": 0, "signals": []}
+                    "pe_weight": 0, "margin": 0, "signals": [],
+                    "vex_data": vex}
 
         # Tie — contradictory signals cancel, no tradeable edge
         if ce_weight == pe_weight:
@@ -100,6 +105,7 @@ def get_directional_bias(
                 "pe_weight": pe_weight,
                 "margin":    0,
                 "signals":   signals,
+                "vex_data":  vex,
             }
 
         direction = Direction.CE.value if ce_weight > pe_weight else Direction.PE.value
@@ -109,10 +115,15 @@ def get_directional_bias(
             "pe_weight": pe_weight,
             "margin":    abs(ce_weight - pe_weight),
             "signals":   signals,
+            # Fix-G: expose vex_data so recommender.py can read the already-computed
+            # VEX snapshot without a second get_vex_cex_current() round-trip.
+            "vex_data":  vex,
         }
 
     except Exception as e:
         logger.warning("get_directional_bias error: {}", e)
+        # vex may not be bound if exception occurred early — do not include vex_data
+        # here. recommender.py falls back to a fresh fetch via the 'or' pattern.
         return {"direction": Direction.NEUTRAL.value, "ce_weight": 0,
                 "pe_weight": 0, "margin": 0, "signals": []}
 
