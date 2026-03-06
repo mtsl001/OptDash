@@ -1,6 +1,6 @@
 """Strike screener — S_score ranking with star ratings.
 
-S_score (0–10) is a weighted composite of 7 independent factors:
+S_score (0–~150) is a weighted composite of 7 independent factors:
   1. delta        — directional sensitivity (proximity to ATM)
   2. theta ratio  — time-decay efficiency (W_THETA cap: 5% daily decay)
   3. liquidity    — OI × LTP in Cr (capped at 5 Cr)
@@ -8,6 +8,12 @@ S_score (0–10) is a weighted composite of 7 independent factors:
   5. gamma        — convexity / acceleration (capped at 0.01)
   6. vega         — IV sensitivity (capped at 50)
   7. eff_ratio    — theta/LTP efficiency at 10% cap (different from W_THETA's 5%)
+
+Theoretical max = (W_DELTA×0.50 + W_EFF_RATIO + W_LIQUIDITY + W_IV
+                   + W_THETA + W_GAMMA + W_VEGA) × 10
+               = (2.0 + 4.0 + 3.0 + 2.0 + 2.0 + 1.0 + 1.0) × 10 = 150
+delta is capped at 0.50 by the SCREENER_MAX_DELTA filter.
+Typical well-screened option scores 70–120.
 """
 import duckdb
 from loguru import logger
