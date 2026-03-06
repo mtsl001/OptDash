@@ -84,8 +84,9 @@ class TermStructureShape(str, Enum):
 
 
 class GEXRegime(str, Enum):
-    POSITIVE_CHOP  = "POSITIVE_CHOP"
-    NEGATIVE_TREND = "NEGATIVE_TREND"
+    POSITIVE_CHOP      = "POSITIVE_CHOP"       # GEX > 0 and above 70% of day peak
+    POSITIVE_DECLINING = "POSITIVE_DECLINING"   # GEX > 0 but below 70% of day peak
+    NEGATIVE_TREND     = "NEGATIVE_TREND"       # GEX < 0 (net dealer short gamma)
 
 
 class VexSignal(str, Enum):
