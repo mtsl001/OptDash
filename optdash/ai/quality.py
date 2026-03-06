@@ -1,18 +1,28 @@
 """Trade quality score — advisory composite, range 0–100.
 
 Three components:
-  C1: Strike quality  (S_score / 20, capped at 1.0)            — max 35
+  C1: Strike quality  (S_score / 120, capped at 1.0)           — max 35
   C2: Gate adequacy   (gate_score / GATE_MAX_SCORE)             — max 35
   C3: Confidence      (confidence / 100)                        — max 30
 
 Grades: A ≥ 80 | B ≥ 65 | C ≥ 50 | D < 50
+
+S_score normalisation:
+  Screener formula: (weighted sum of 7 factors) × 10
+  Max possible = (W_DELTA×0.50 + W_EFF_RATIO + W_LIQUIDITY + W_IV
+                  + W_THETA + W_GAMMA + W_VEGA) × 10 = 150
+  Practical 99th-pct for screened options ≈ 120 → used as normaliser.
 """
 from optdash.config import settings
 
+# 99th-percentile S_score for well-screened options on the 0–150 scale.
+# Derived from: max_raw_sum × 10 = 150; typical top-of-range ≈ 120.
+_SSCORE_NORM = 120.0
+
 
 def compute_quality_score(strike: dict, gate_score: int, confidence: int) -> dict:
-    # C1: S_score normalised to 20 (99th-percentile typical range)
-    sscore_norm = min(1.0, (strike.get("s_score") or 0) / 20)
+    # C1: S_score normalised against practical 99th-pct range (0–120 → 0–1.0)
+    sscore_norm = min(1.0, (strike.get("s_score") or 0) / _SSCORE_NORM)
     c1 = sscore_norm * 35
 
     # C2: Gate adequacy — guard against misconfigured GATE_MAX_SCORE=0
