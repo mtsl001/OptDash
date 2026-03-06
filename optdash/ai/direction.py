@@ -1,11 +1,11 @@
 """Directional bias engine — weighted signal voting.
 
 Signal weights:
-  V_CoC velocity spike  → weight 3  (strongest: order-flow momentum)
-  Futures OBI           → weight 2  (institutional positioning)
-  VEX alignment         → weight 2  (dealer mechanical flow)
-  ATM OBI               → weight 1  (options order imbalance)
-  PCR divergence        → weight 1  (retail sentiment contra-indicator)
+  V_CoC velocity spike  -> weight 3  (strongest: order-flow momentum)
+  Futures OBI           -> weight 2  (institutional positioning)
+  VEX alignment         -> weight 2  (dealer mechanical flow)
+  ATM OBI               -> weight 1  (options order imbalance)
+  PCR divergence        -> weight 1  (retail sentiment contra-indicator)
 
 Max CE/PE weight = 9 (all signals same direction).
 Ties (ce_weight == pe_weight) yield NEUTRAL — no edge when signals cancel.
@@ -44,7 +44,7 @@ def get_directional_bias(
             signals.append({"signal": "VCOC_BEAR", "weight": 3,
                              "direction": Direction.PE.value, "value": vcoc})
 
-        # ── Signal 2: Futures OBI (weight 2) ──────────────────────────────
+        # ── Signal 2: Futures OBI (weight 2) ────────────────────────────
         # FUT_OBI_BEAR_THRESHOLD is a per-underlying dict — resolve before comparison.
         fut_obi_thr = settings.FUT_OBI_BEAR_THRESHOLD.get(underlying, -0.20)
         if fobi < fut_obi_thr:
@@ -54,16 +54,20 @@ def get_directional_bias(
             signals.append({"signal": "FUT_OBI_BULL", "weight": 2,
                              "direction": Direction.CE.value, "value": fobi})
 
-        # ── Signal 3: VEX alignment (weight 2) ────────────────────────────
-        vex_total = vex.get("vex_total_M", 0)
-        if vex_total > 0:
+        # ── Signal 3: VEX alignment (weight 2) ──────────────────────────
+        # Fix-E: use per-underlying threshold (same dict as _classify_vex)
+        # instead of bare > 0 / < 0. This prevents weight-2 ghost votes when
+        # VEX noise oscillates around zero on low-liquidity underlyings.
+        vex_total = vex.get("vex_total_M", 0) or 0
+        vex_thr   = settings.VEX_THRESHOLDS.get(underlying, settings.VEX_BULL_THRESHOLD)
+        if vex_total > vex_thr:
             signals.append({"signal": "VEX_BULL", "weight": 2,
                              "direction": Direction.CE.value, "value": vex_total})
-        elif vex_total < 0:
+        elif vex_total < -vex_thr:
             signals.append({"signal": "VEX_BEAR", "weight": 2,
                              "direction": Direction.PE.value, "value": vex_total})
 
-        # ── Signal 4: ATM OBI (weight 1) ─────────────────────────────────
+        # ── Signal 4: ATM OBI (weight 1) ──────────────────────────────
         if obi > settings.OBI_THRESHOLD:
             signals.append({"signal": "OBI_BULL", "weight": 1,
                              "direction": Direction.CE.value, "value": obi})
@@ -71,7 +75,7 @@ def get_directional_bias(
             signals.append({"signal": "OBI_BEAR", "weight": 1,
                              "direction": Direction.PE.value, "value": obi})
 
-        # ── Signal 5: PCR divergence (weight 1) ───────────────────────────
+        # ── Signal 5: PCR divergence (weight 1) ─────────────────────────
         div = pcr.get("pcr_divergence", 0)
         if div > settings.PCR_DIV_BULL_THRESHOLD:
             signals.append({"signal": "PCR_RETAIL_PUTS", "weight": 1,
