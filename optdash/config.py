@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     # Raw Parquet files (pre-enrichment) are purged after this many calendar days.
     # Processed Parquets are kept permanently as the audit trail.
     RAW_PARQUET_RETENTION_DAYS: int = 3
+    # Rolling lookback window for the DuckDB options_data view.
+    # Only the last N calendar days of data/processed/ are included in the
+    # view, bounding scan cost regardless of how long the service runs.
+    # 5 = full Mon-Fri week; increase for longer historical analytics.
+    DUCK_VIEW_LOOKBACK_DAYS: int = 5
 
     # -- GEX
     GEX_NEAR_WEEKS:        int   = 2
