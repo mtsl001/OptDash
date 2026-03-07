@@ -1,4 +1,12 @@
-"""FastAPI application factory."""
+"""FastAPI application factory.
+
+Primary entry point:  python run_api.py  (includes scheduler)
+Standalone DB-only:   uvicorn run_api:app
+
+This module only exports the create_app() factory and _default_lifespan.
+No module-level app instance is created here -- run_api.py is the sole
+owner of the live FastAPI object.
+"""
 from contextlib import asynccontextmanager
 from typing import Any
 from fastapi import FastAPI
@@ -12,10 +20,11 @@ from optdash.api.routers import market, micro, screener, ai, ws
 
 @asynccontextmanager
 async def _default_lifespan(app: FastAPI):
-    """Default lifespan for standalone use (uvicorn optdash.api.app:app).
-    DB connections only — no scheduler.
+    """Default lifespan for DB-only use (no scheduler).
+    Used when create_app() is called without a custom lifespan,
+    e.g. in tests or programmatic standalone usage.
     """
-    logger.info("OptDash API starting up (standalone)...")
+    logger.info("OptDash API starting up (standalone, no scheduler)...")
     await startup(app)
     yield
     logger.info("OptDash API shutting down...")
@@ -52,7 +61,3 @@ def create_app(lifespan: Any = None) -> FastAPI:
         return {"status": "ok", "version": "2.0.0"}
 
     return app
-
-
-# Standalone instance — works with: uvicorn optdash.api.app:app
-app = create_app()
