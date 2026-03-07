@@ -152,19 +152,32 @@ def reject(
             "Use /close-trade to exit a live position."
         )
 
-    # Shadow: track what would have happened had we taken this recommendation.
-    # This is the core of the learning engine - CLEAN_MISS vs GOOD_SKIP.
-    shadow.create_shadow(jconn, {
-        "trade_id":      req.trade_id,
-        "trade_date":    trade["trade_date"],
-        "underlying":    trade["underlying"],
-        "option_type":   trade["option_type"],
-        "strike_price":  trade["strike_price"],
-        "expiry_date":   trade["expiry_date"],
-        "entry_premium": trade["entry_premium"],
-    })
+    # Fix-N (F-06): wrap shadow creation + status update in a single
+    # transaction.  Without this, a failure in reject_trade() after
+    # shadow.create_shadow() would leave an orphaned shadow record with
+    # no parent trade in REJECTED state, silently corrupting learning stats.
+    try:
+        jconn.execute("BEGIN")
+        # Shadow: track what would have happened had we taken this
+        # recommendation.  Core of the learning engine - CLEAN_MISS vs
+        # GOOD_SKIP.
+        shadow.create_shadow(jconn, {
+            "trade_id":      req.trade_id,
+            "trade_date":    trade["trade_date"],
+            "underlying":    trade["underlying"],
+            "option_type":   trade["option_type"],
+            "strike_price":  trade["strike_price"],
+            "expiry_date":   trade["expiry_date"],
+            "entry_premium": trade["entry_premium"],
+        })
+        trades.reject_trade(jconn, req.trade_id, req.reason, req.note)
+        jconn.execute("COMMIT")
+    except Exception as exc:
+        jconn.execute("ROLLBACK")
+        raise HTTPException(
+            500, f"Reject failed and was rolled back: {exc}"
+        ) from exc
 
-    trades.reject_trade(jconn, req.trade_id, req.reason, req.note)
     return {"status": "rejected", "trade_id": req.trade_id}
 
 
