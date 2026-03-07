@@ -1,9 +1,9 @@
-"""EOD sweep — force-close all open positions and finalize shadows at market close."""
+"""EOD sweep - force-close all open positions and finalize shadows at market close."""
 import duckdb
 import sqlite3
 from loguru import logger
 from optdash.config import settings
-from optdash.models import ExitReason, ShadowOutcome
+from optdash.models import ExitReason, ShadowOutcome, TradeStatus
 from optdash.ai.journal import trades, shadow
 from optdash.ai.tracker import _fetch_strike_current
 from optdash.ai.shadow_tracker import _classify_shadow_outcome
@@ -14,7 +14,27 @@ def eod_force_close(
     jconn:      sqlite3.Connection,
     trade_date: str,
 ) -> None:
-    """Force-close all ACCEPTED trades still open at EOD."""
+    """Force-close all ACCEPTED trades and expire all GENERATED recommendations at EOD.
+
+    Fix-J (F-02): Pending (GENERATED) recommendations are now expired here.
+    Previously they survived into the next trading day, causing
+    generate_recommendation() to skip generation all morning because it
+    found a stale pending trade from the previous session's close.
+    """
+    # Step 1: Expire all pending (GENERATED) recommendations across all underlyings.
+    # Must run before the open-position loop so the journal is clean for next session.
+    pending = trades.get_pending_trades(jconn)
+    for p in pending:
+        trades.update_status(
+            jconn, p["id"], TradeStatus.EXPIRED.value,
+            state_reason="EOD sweep -- expired unseen recommendation"
+        )
+        logger.info(
+            "EOD expired pending recommendation: id={} underlying={} snap={}",
+            p["id"], p["underlying"], p["snap_time"]
+        )
+
+    # Step 2: Force-close all ACCEPTED (open) positions.
     open_trades = trades.get_open_trades(jconn)
     snap_time   = settings.EOD_FORCE_CLOSE_TIME
 
