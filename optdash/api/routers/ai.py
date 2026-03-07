@@ -15,8 +15,6 @@ from optdash.models import TradeStatus, ExitReason
 
 router = APIRouter()
 
-DEFAULT_UNDERLYING = "NIFTY"
-
 # HH:MM 24-hour clock -- validated at API boundary so downstream snap-time
 # arithmetic never receives a malformed string.
 # Examples: '09:15', '15:25'  Valid range: 00:00 - 23:59
@@ -96,7 +94,7 @@ def _hydrate_trade(trade: dict | None) -> dict | None:
 
 @router.get("/recommendation/latest")
 def latest_recommendation(
-    underlying: str = Query(DEFAULT_UNDERLYING),
+    underlying: str = Query(settings.DEFAULT_UNDERLYING),
     jconn: sqlite3.Connection = Depends(get_journal),
 ):
     pending = trades.get_pending_trades(jconn, underlying=underlying)
@@ -107,7 +105,7 @@ def latest_recommendation(
 
 @router.get("/position/live")
 def live_position(
-    underlying: str = Query(DEFAULT_UNDERLYING),
+    underlying: str = Query(settings.DEFAULT_UNDERLYING),
     jconn: sqlite3.Connection = Depends(get_journal),
 ):
     open_trades = trades.get_open_trades(jconn, underlying=underlying)
@@ -179,14 +177,7 @@ def reject(
     # commits independently.  Python's sqlite3 implicit transaction keeps
     # both INSERTs in the same transaction until we call jconn.commit().
     # On any failure jconn.rollback() undoes both writes atomically.
-    #
-    # Previous approach (jconn.execute("BEGIN") wrapper) was broken because
-    # the DAOs called conn.commit() internally, committing each write
-    # separately and making ROLLBACK a no-op for already-committed rows.
     try:
-        # Shadow: track what would have happened had we taken this
-        # recommendation.  Core of the learning engine - CLEAN_MISS vs
-        # GOOD_SKIP.
         shadow.create_shadow(jconn, {
             "trade_id":      req.trade_id,
             "trade_date":    trade["trade_date"],

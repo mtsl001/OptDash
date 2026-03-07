@@ -14,10 +14,14 @@ class Settings(BaseSettings):
     JOURNAL_DB_PATH: Path = Path("./data/journal.db")
 
     # -- API
-    API_HOST:     str       = "0.0.0.0"
-    API_PORT:     int       = 8000
-    LOG_LEVEL:    str       = "INFO"
-    CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000"]
+    API_HOST:          str       = "0.0.0.0"
+    API_PORT:          int       = 8000
+    LOG_LEVEL:         str       = "INFO"
+    CORS_ORIGINS:      list[str] = ["http://localhost:5173", "http://localhost:3000"]
+    # Default underlying for endpoints that take an optional underlying param.
+    # Override via DEFAULT_UNDERLYING= in .env for deployments where a
+    # different index is the primary instrument.
+    DEFAULT_UNDERLYING: str = "NIFTY"
 
     # -- Scheduler
     SCHEDULER_INTERVAL_SECONDS: int = 300  # 5-min tick
@@ -88,7 +92,7 @@ class Settings(BaseSettings):
     # Per-underlying VEX magnitude thresholds (Rs M).
     # Scaled to index liquidity: liquid large-caps (NIFTY/BANKNIFTY) need a
     # higher bar to filter noise; illiquid underlyings need a lower bar.
-    # Fix-B: these were absent — classifiers used VEX_BULL_THRESHOLD=0.0
+    # Fix-B: these were absent -- classifiers used VEX_BULL_THRESHOLD=0.0
     # for all underlyings, causing spurious signals on low-volume indices.
     VEX_THRESHOLDS: dict = {
         "NIFTY": 0.50, "BANKNIFTY": 0.50, "FINNIFTY": 0.25,
