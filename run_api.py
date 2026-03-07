@@ -10,6 +10,11 @@ DuckDB note:
   deps.startup() calls duckdb_gateway.startup() internally -- no
   explicit duck_path wiring is needed here.  The scheduler also
   uses the shared gateway connection (no duck_path argument).
+
+SQLite note:
+  deps.startup() opens the shared journal connection and stores it on
+  app.state.journal.  The scheduler receives this connection directly
+  (journal_conn=app.state.journal) so no per-tick SQLite opens occur.
 """
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -29,9 +34,10 @@ async def lifespan(app: FastAPI):
     # 1. Open DB connections (DuckDB gateway + SQLite journal)
     await startup(app)
 
-    # 2. Start scheduler (uses shared DuckDB gateway connection)
+    # 2. Start scheduler -- passes the shared SQLite connection so the
+    #    scheduler never opens a new connection per tick (Fix-M / F-05).
     scheduler = create_scheduler(
-        journal_path=settings.JOURNAL_DB_PATH,
+        journal_conn=app.state.journal,
     )
     scheduler.start()
     app.state.scheduler = scheduler

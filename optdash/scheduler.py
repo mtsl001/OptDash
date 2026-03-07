@@ -16,6 +16,14 @@ read_only=True) per tick) opened a file-based connection that had no
 options_data Parquet view registered, causing every analytics call to fail
 silently with 'Table options_data not found'.
 
+SQLite connection
+-----------------
+The scheduler reuses the shared SQLite connection passed in via
+journal_conn (owned by deps.startup / app.state.journal).  The old
+pattern (_make_jconn per tick) opened a new connection every 5 minutes,
+creating ~72 open/close cycles per trading day and bypassing the shared
+WAL-mode connection already maintained by the API layer.
+
 Both API request handlers and the scheduler run in the same asyncio event
 loop (AsyncIOScheduler).  Because all DuckDB calls are synchronous and
 never yield to the event loop, each tick runs atomically -- no concurrent
@@ -73,16 +81,6 @@ def _eod_done_today(done_flags: dict) -> bool:
     return done_flags.get(_today_str(), False)
 
 
-def _make_jconn(journal_path) -> sqlite3.Connection:
-    """Open a SQLite connection with WAL mode and FK enforcement."""
-    jconn = sqlite3.connect(str(journal_path), check_same_thread=False)
-    jconn.row_factory = sqlite3.Row
-    jconn.execute("PRAGMA journal_mode=WAL")
-    jconn.execute("PRAGMA synchronous=NORMAL")  # safe with WAL, ~3x faster
-    jconn.execute("PRAGMA foreign_keys=ON")
-    return jconn
-
-
 def _build_gate_cache(
     duck, trade_date: str, snap_time: str, jconn: sqlite3.Connection
 ) -> dict:
@@ -117,11 +115,15 @@ def _build_gate_cache(
 
 
 def create_scheduler(
-    journal_path: str,
+    journal_conn: sqlite3.Connection,
 ) -> AsyncIOScheduler:
     """
     Returns a configured AsyncIOScheduler.
     Call scheduler.start() inside FastAPI lifespan (after deps.startup()).
+
+    journal_conn: shared SQLite connection owned by deps.startup()
+    (stored on app.state.journal).  The scheduler reuses this connection
+    directly -- no new SQLite connections are opened per tick.
 
     Note: duck_path removed -- the scheduler now uses the shared DuckDB
     gateway connection (get_conn()) so it reads the same registered
@@ -137,11 +139,12 @@ def create_scheduler(
         trade_date = _today_str()
         snap_time  = _snap_time_str()
 
-        jconn = None
         try:
             # Shared in-process DuckDB -- gateway owns its lifecycle.
             duck  = get_conn()
-            jconn = _make_jconn(journal_path)
+            # Shared SQLite -- lifecycle owned by deps.shutdown().
+            # Do NOT close jconn here.
+            jconn = journal_conn
 
             # -- EOD sweep (once per calendar day) ----------------------------
             if _is_eod() and not _eod_done_today(done_flags):
@@ -206,12 +209,6 @@ def create_scheduler(
 
         except Exception as e:
             logger.error("Scheduler tick error @ {}: {}", snap_time, e)
-        finally:
-            if jconn:
-                try:
-                    jconn.close()
-                except Exception:
-                    pass
 
     scheduler = AsyncIOScheduler(timezone=IST)
     scheduler.add_job(
