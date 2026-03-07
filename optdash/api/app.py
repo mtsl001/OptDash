@@ -8,6 +8,7 @@ No module-level app instance is created here -- run_api.py is the sole
 owner of the live FastAPI object.
 """
 from contextlib import asynccontextmanager
+from importlib.metadata import version as _pkg_version, PackageNotFoundError
 from typing import Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +17,14 @@ from loguru import logger
 from optdash.config import settings
 from optdash.api.deps import startup, shutdown
 from optdash.api.routers import market, micro, screener, ai, ws
+
+# Single source of truth: pyproject.toml [project] version.
+# Falls back to the last known version when the package is not installed
+# (e.g. running with PYTHONPATH=. in a dev environment without pip install -e .).
+try:
+    _APP_VERSION = _pkg_version("optdash")
+except PackageNotFoundError:
+    _APP_VERSION = "2.0.0"
 
 
 @asynccontextmanager
@@ -37,7 +46,7 @@ def create_app(lifespan: Any = None) -> FastAPI:
     """
     app = FastAPI(
         title="OptDash API",
-        version="2.0.0",
+        version=_APP_VERSION,
         description="Options Analytics & AI Trading Engine",
         lifespan=lifespan or _default_lifespan,
     )
@@ -74,6 +83,6 @@ def create_app(lifespan: Any = None) -> FastAPI:
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "version": "2.0.0"}
+        return {"status": "ok", "version": _APP_VERSION}
 
     return app
