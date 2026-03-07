@@ -163,12 +163,15 @@ def reject(
             "Use /close-trade to exit a live position."
         )
 
-    # Fix-N (F-06): wrap shadow creation + status update in a single
-    # transaction.  Without this, a failure in reject_trade() after
-    # shadow.create_shadow() would leave an orphaned shadow record with
-    # no parent trade in REJECTED state, silently corrupting learning stats.
+    # Fix-N proper (F-06): use commit=False on both DAOs so neither write
+    # commits independently.  Python's sqlite3 implicit transaction keeps
+    # both INSERTs in the same transaction until we call jconn.commit().
+    # On any failure jconn.rollback() undoes both writes atomically.
+    #
+    # Previous approach (jconn.execute("BEGIN") wrapper) was broken because
+    # the DAOs called conn.commit() internally, committing each write
+    # separately and making ROLLBACK a no-op for already-committed rows.
     try:
-        jconn.execute("BEGIN")
         # Shadow: track what would have happened had we taken this
         # recommendation.  Core of the learning engine - CLEAN_MISS vs
         # GOOD_SKIP.
@@ -180,11 +183,13 @@ def reject(
             "strike_price":  trade["strike_price"],
             "expiry_date":   trade["expiry_date"],
             "entry_premium": trade["entry_premium"],
-        })
-        trades.reject_trade(jconn, req.trade_id, req.reason, req.note)
-        jconn.execute("COMMIT")
+        }, commit=False)
+        trades.reject_trade(
+            jconn, req.trade_id, req.reason, req.note, commit=False
+        )
+        jconn.commit()   # single atomic commit -- both writes land together
     except Exception as exc:
-        jconn.execute("ROLLBACK")
+        jconn.rollback()
         raise HTTPException(
             500, f"Reject failed and was rolled back: {exc}"
         ) from exc

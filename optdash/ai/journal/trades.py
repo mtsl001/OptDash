@@ -101,7 +101,7 @@ def update_status(
     """Update trade status and optionally persist a state_reason.
 
     COALESCE(?, rejection_reason) writes the new reason when provided,
-    and preserves the existing value when state_reason is None —
+    and preserves the existing value when state_reason is None --
     so a bare status update never clears a previously recorded reason.
 
     Fix-H: previously state_reason was accepted but silently dropped.
@@ -140,7 +140,15 @@ def reject_trade(
     trade_id: int,
     reason:   str,
     note:     str | None = None,
+    commit:   bool = True,
 ) -> None:
+    """Update trade status to REJECTED.
+
+    commit=True  (default): commit immediately -- safe for standalone calls.
+    commit=False: leave the UPDATE in the current implicit transaction so
+    the caller can bundle it with shadow.create_shadow() and commit once,
+    making both writes atomic (used by the /reject API endpoint).
+    """
     conn.execute(
         """UPDATE trades
            SET status='REJECTED', rejection_reason=?, rejection_note=?,
@@ -148,7 +156,8 @@ def reject_trade(
            WHERE id=?""",
         [reason, note, trade_id]
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def close_trade(
@@ -178,7 +187,7 @@ def close_trade(
     conn.commit()
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# -- Helpers ------------------------------------------------------------------
 
 def _fetchall(conn: sqlite3.Connection, q: str, params: list) -> list[dict]:
     """Execute query and return list of dicts.

@@ -2,14 +2,21 @@
 import sqlite3
 
 
-def create_shadow(conn: sqlite3.Connection, data: dict) -> int:
+def create_shadow(conn: sqlite3.Connection, data: dict, commit: bool = True) -> int:
+    """Insert a new shadow trade record.
+
+    commit=True  (default): commit immediately -- safe for standalone calls.
+    commit=False: leave the INSERT in the current implicit transaction so the
+    caller can bundle it with other writes (e.g. reject_trade) and commit once.
+    """
     cols         = ", ".join(data.keys())
     placeholders = ", ".join(["?"] * len(data))
     cur = conn.execute(
         f"INSERT INTO shadow_trades ({cols}) VALUES ({placeholders})",
         list(data.values())
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.lastrowid
 
 
