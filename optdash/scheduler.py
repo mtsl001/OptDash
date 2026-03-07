@@ -2,10 +2,11 @@
 
 Tick structure (every SCHEDULER_INTERVAL_SECONDS, market hours only):
   1. Expire stale pending recommendations  -> once per tick (all underlyings)
-  2. Generate recommendations              -> once per underlying
-  3. Track open positions                  -> once per tick (all open trades)
-  4. Track shadow positions                -> once per tick (all shadow trades)
-  5. EOD sweep                             -> once per calendar day
+  2. Pre-compute gate cache for open trades -> once per tick (all open positions)
+  3. Generate recommendations              -> once per underlying
+  4. Track open positions                  -> once per tick (uses gate cache)
+  5. Track shadow positions                -> once per tick (all shadow trades)
+  6. EOD sweep                             -> once per calendar day
 
 DuckDB connection
 -----------------
@@ -33,6 +34,8 @@ from optdash.ai.recommender import generate_recommendation
 from optdash.ai.tracker import track_open_positions, expire_stale_recommendations
 from optdash.ai.shadow_tracker import track_shadow_positions
 from optdash.ai.eod import eod_force_close, finalize_all_shadows
+from optdash.ai.journal.trades import get_open_trades
+from optdash.analytics.environment import get_environment_score
 from optdash.pipeline.purge import purge_old_raw_parquets
 from optdash.pipeline.duckdb_gateway import get_conn, refresh_views
 
@@ -80,6 +83,39 @@ def _make_jconn(journal_path) -> sqlite3.Connection:
     return jconn
 
 
+def _build_gate_cache(
+    duck, trade_date: str, snap_time: str, jconn: sqlite3.Connection
+) -> dict:
+    """Pre-compute gate scores for all currently open positions.
+
+    Fix-L (F-04): track_open_positions() was calling get_environment_score()
+    (7 DuckDB aggregations) once per open trade. This pre-computation runs
+    the gate exactly once per unique underlying and passes the result in so
+    track_open_positions() can skip the per-position re-query.
+
+    Gate is computed with the actual option_type (direction) so C9 (2 pts)
+    scores correctly and NO_GO verdicts are not under-counted.
+    """
+    open_trades = get_open_trades(jconn)
+    cache: dict[str, dict] = {}
+    for t in open_trades:
+        underlying = t["underlying"]
+        if underlying in cache:
+            continue  # only compute once per underlying
+        try:
+            cache[underlying] = get_environment_score(
+                duck, trade_date, snap_time,
+                underlying, direction=t["option_type"]
+            )
+        except Exception as e:
+            logger.warning("gate_cache pre-compute failed for {}: {}", underlying, e)
+            cache[underlying] = {
+                "score": 0, "verdict": "NO_GO",
+                "conditions": {}, "session": ""
+            }
+    return cache
+
+
 def create_scheduler(
     journal_path: str,
 ) -> AsyncIOScheduler:
@@ -107,7 +143,7 @@ def create_scheduler(
             duck  = get_conn()
             jconn = _make_jconn(journal_path)
 
-            # ── EOD sweep (once per calendar day) ─────────────────────────────
+            # -- EOD sweep (once per calendar day) ----------------------------
             if _is_eod() and not _eod_done_today(done_flags):
                 logger.info("Running EOD sweep for {}", trade_date)
                 eod_force_close(duck, jconn, trade_date)
@@ -130,13 +166,24 @@ def create_scheduler(
                 except Exception as rv_err:
                     logger.error("refresh_views failed: {}", rv_err)
 
+                # Trim done_flags to last 7 entries to prevent unbounded growth.
+                if len(done_flags) > 7:
+                    oldest = sorted(done_flags)[0]
+                    del done_flags[oldest]
+
                 done_flags[trade_date] = True
                 return  # skip normal tick on EOD
 
-            # ── Step 1: Expire stale pending recommendations ───────────────────
+            # -- Step 1: Expire stale pending recommendations ------------------
             expire_stale_recommendations(jconn, trade_date, snap_time)
 
-            # ── Step 2: Generate new recommendations (per underlying) ──────────
+            # -- Step 2: Pre-compute gate cache for all open positions ---------
+            # get_environment_score runs 7 DuckDB aggregations per underlying.
+            # Caching here avoids repeating those queries once per open trade
+            # inside track_open_positions() (Fix-L / F-04).
+            gate_cache = _build_gate_cache(duck, trade_date, snap_time, jconn)
+
+            # -- Step 3: Generate new recommendations (per underlying) ---------
             for underlying in settings.UNDERLYINGS:
                 rec = generate_recommendation(
                     duck, jconn, trade_date, snap_time, underlying
@@ -150,10 +197,11 @@ def create_scheduler(
                         rec.get("strike_price"),
                     )
 
-            # ── Step 3: Track all open positions (once, not per-underlying) ─────
-            track_open_positions(duck, jconn, trade_date, snap_time)
+            # -- Step 4: Track all open positions (gate_cache avoids N+1) ------
+            track_open_positions(duck, jconn, trade_date, snap_time,
+                                 gate_cache=gate_cache)
 
-            # ── Step 4: Track all shadow positions (once) ──────────────────────
+            # -- Step 5: Track all shadow positions ----------------------------
             track_shadow_positions(duck, jconn, trade_date, snap_time)
 
         except Exception as e:

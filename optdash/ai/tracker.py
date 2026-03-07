@@ -14,8 +14,15 @@ def track_open_positions(
     jconn:      sqlite3.Connection,
     trade_date: str,
     snap_time:  str,
+    gate_cache: dict | None = None,
 ) -> None:
-    """Check every ACCEPTED trade and update position snaps."""
+    """Check every ACCEPTED trade and update position snaps.
+
+    gate_cache: optional pre-computed gate scores keyed by underlying.
+    When provided by the scheduler tick, get_environment_score() is skipped
+    for cached underlyings, eliminating N+1 DuckDB round-trips (Fix-L / F-04).
+    When absent (e.g. direct API calls), gate is computed fresh per trade.
+    """
     open_trades = trades.get_open_trades(jconn)
     for trade in open_trades:
         underlying = trade["underlying"]
@@ -77,9 +84,15 @@ def track_open_positions(
         )
 
         # Gate check
-        gate       = get_environment_score(
-            conn, trade_date, snap_time, underlying, direction=opt_type
-        )
+        # Fix-L (F-04): use pre-computed gate from scheduler tick cache if
+        # available -- avoids re-running 7 DuckDB aggregations per open position.
+        # Falls back to fresh computation if called without cache (e.g. direct API).
+        if gate_cache and underlying in gate_cache:
+            gate = gate_cache[underlying]
+        else:
+            gate = get_environment_score(
+                conn, trade_date, snap_time, underlying, direction=opt_type
+            )
         gate_no_go = gate["verdict"] == "NO_GO"
 
         # PnL attribution
