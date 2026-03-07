@@ -1,4 +1,4 @@
-"""AI endpoints — recommendation, accept/reject, position, journal, learning."""
+"""AI endpoints - recommendation, accept/reject, position, journal, learning."""
 import json
 import sqlite3
 from fastapi import APIRouter, Depends, Query, HTTPException
@@ -15,7 +15,7 @@ router = APIRouter()
 DEFAULT_UNDERLYING = "NIFTY"
 
 
-# ── Request schemas ───────────────────────────────────────────────────
+# -- Request schemas ----------------------------------------------------------
 
 class AcceptRequest(BaseModel):
     trade_id:           int
@@ -35,7 +35,7 @@ class CloseRequest(BaseModel):
     snap_time:  str
 
 
-# ── Response helpers ───────────────────────────────────────────────────
+# -- Response helpers ---------------------------------------------------------
 
 def _hydrate_trade(trade: dict | None) -> dict | None:
     """Deserialize JSON-string fields in a raw journal trade dict.
@@ -68,7 +68,7 @@ def _hydrate_trade(trade: dict | None) -> dict | None:
     return result
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────
+# -- Endpoints ----------------------------------------------------------------
 
 @router.get("/recommendation/latest")
 def latest_recommendation(
@@ -119,20 +119,15 @@ def accept(
         raise HTTPException(404, "Trade not found")
     if trade["status"] != TradeStatus.GENERATED.value:
         raise HTTPException(
-            400, f"Cannot accept trade in status '{trade['status']}'."
+            400, f"Cannot accept trade in status '{trade['status']}'"
         )
 
-    # Create shadow trade for what-if comparison tracking
-    shadow.create_shadow(jconn, {
-        "trade_id":      req.trade_id,
-        "trade_date":    trade["trade_date"],
-        "underlying":    trade["underlying"],
-        "option_type":   trade["option_type"],
-        "strike_price":  trade["strike_price"],
-        "expiry_date":   trade["expiry_date"],
-        "entry_premium": trade["entry_premium"],
-    })
-
+    # Fix-J (F-03): Removed shadow.create_shadow() from the accept path.
+    # Shadows are ONLY for rejected/expired trades (what-if tracking).
+    # Creating a shadow on accept was corrupting the learning engine:
+    # when the shadow hit its mechanical target it was classified as
+    # CLEAN_MISS (costly rejection), inverting the learning signal for
+    # trades that were actually taken and won.
     trades.accept_trade(jconn, req.trade_id, req.snap_time, req.actual_entry_price)
     return {"status": "accepted", "trade_id": req.trade_id}
 
@@ -157,7 +152,7 @@ def reject(
         )
 
     # Shadow: track what would have happened had we taken this recommendation.
-    # This is the core of the learning engine — CLEAN_MISS vs GOOD_SKIP.
+    # This is the core of the learning engine - CLEAN_MISS vs GOOD_SKIP.
     shadow.create_shadow(jconn, {
         "trade_id":      req.trade_id,
         "trade_date":    trade["trade_date"],
