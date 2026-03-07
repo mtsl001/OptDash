@@ -1,9 +1,10 @@
 """AI endpoints - recommendation, accept/reject, position, journal, learning."""
 import json
 import sqlite3
+from typing import Annotated
 from fastapi import APIRouter, Depends, Query, HTTPException
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, StringConstraints
 
 from optdash.api.deps import get_journal
 from optdash.ai.journal import trades, shadow, snaps
@@ -16,12 +17,23 @@ router = APIRouter()
 
 DEFAULT_UNDERLYING = "NIFTY"
 
+# HH:MM 24-hour clock -- validated at API boundary so downstream snap-time
+# arithmetic never receives a malformed string.
+# Examples: '09:15', '15:25'  Valid range: 00:00 - 23:59
+SnapTime = Annotated[
+    str,
+    StringConstraints(
+        pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$",
+        strip_whitespace=True,
+    ),
+]
+
 
 # -- Request schemas ----------------------------------------------------------
 
 class AcceptRequest(BaseModel):
     trade_id:           int
-    snap_time:          str
+    snap_time:          SnapTime
     actual_entry_price: float | None = None
 
 
@@ -34,7 +46,7 @@ class RejectRequest(BaseModel):
 class CloseRequest(BaseModel):
     trade_id:   int
     exit_price: float
-    snap_time:  str
+    snap_time:  SnapTime
 
 
 # -- Response helpers ---------------------------------------------------------
