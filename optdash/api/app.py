@@ -50,6 +50,22 @@ def create_app(lifespan: Any = None) -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Fix-P (F-12): warn loudly when CORS is still in dev-only mode.
+    # localhost origins block all production cross-origin requests silently.
+    # The warning fires at factory time (process startup) so it always
+    # appears in boot logs before any request is handled.
+    _dev_origins = [
+        o for o in settings.CORS_ORIGINS
+        if "localhost" in o or "127.0.0.1" in o
+    ]
+    if _dev_origins:
+        logger.warning(
+            "CORS: dev-only origins detected -- requests from production "
+            "frontends will be blocked.  Set CORS_ORIGINS in .env before "
+            "deploying.  Active dev origins: {}",
+            _dev_origins,
+        )
+
     app.include_router(market.router,   prefix="/api/market",   tags=["market"])
     app.include_router(micro.router,    prefix="/api/micro",    tags=["micro"])
     app.include_router(screener.router, prefix="/api/screener", tags=["screener"])
