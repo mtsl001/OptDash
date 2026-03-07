@@ -47,10 +47,12 @@ def eod_force_close(
 
         # Use actual_entry_price (slippage-adjusted) if trader set one on accept.
         # Falls back to recommended entry_premium only if actual not recorded.
-        entry   = trade["actual_entry_price"] or trade["entry_premium"]
-        ltp     = (current or {}).get("ltp") or entry
-        pnl_abs = round(ltp - entry, 2)
-        pnl_pct = round(pnl_abs / entry * 100, 2) if entry else 0.0
+        entry    = trade["actual_entry_price"] or trade["entry_premium"]
+        ltp      = (current or {}).get("ltp") or entry
+        lot      = settings.LOT_SIZES.get(trade["underlying"], 1)
+        # Fix-K (F-01): pnl_abs is monetary (point_diff * lot); pnl_pct stays per-unit %
+        pnl_abs  = round((ltp - entry) * lot, 2)
+        pnl_pct  = round((ltp - entry) / entry * 100, 2) if entry else 0.0
 
         trades.close_trade(jconn, trade["id"], {
             "exit_premium":   ltp,

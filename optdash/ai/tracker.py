@@ -40,9 +40,11 @@ def track_open_positions(
         # recorded one on ACCEPT. Falls back to recommended entry_premium.
         # This matches eod.py and ensures all PnL/trailing-stop math is
         # based on what the trader actually paid, not what was recommended.
-        entry   = trade["actual_entry_price"] or trade["entry_premium"]
-        pnl_abs = round(ltp - entry, 2)
-        pnl_pct = round((pnl_abs / entry) * 100, 2) if entry else 0.0
+        entry = trade["actual_entry_price"] or trade["entry_premium"]
+        lot   = settings.LOT_SIZES.get(underlying, 1)
+        # Fix-K (F-01): pnl_abs is monetary (point_diff * lot); pnl_pct stays per-unit %
+        pnl_abs = round((ltp - entry) * lot, 2)
+        pnl_pct = round((ltp - entry) / entry * 100, 2) if entry else 0.0
 
         # Theta SL
         t_elapsed   = _minutes_since_entry(trade["snap_time"], snap_time)

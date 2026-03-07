@@ -8,6 +8,7 @@ from optdash.api.deps import get_journal
 from optdash.ai.journal import trades, shadow, snaps
 from optdash.ai.learning.report import build_learning_report
 from optdash.analytics.pnl import build_theta_sl_series
+from optdash.config import settings
 from optdash.models import TradeStatus, ExitReason
 
 router = APIRouter()
@@ -179,9 +180,12 @@ def close_position(
     if trade["status"] != TradeStatus.ACCEPTED.value:
         raise HTTPException(400, f"Trade not open (status='{trade['status']}')")
 
-    entry   = trade["actual_entry_price"] or trade["entry_premium"]
-    pnl_abs = round(req.exit_price - entry, 2)
-    pnl_pct = round(pnl_abs / entry * 100, 2)
+    underlying = trade["underlying"]
+    entry      = trade["actual_entry_price"] or trade["entry_premium"]
+    lot        = settings.LOT_SIZES.get(underlying, 1)
+    # Fix-K (F-01): pnl_abs is monetary (point_diff * lot); pnl_pct stays per-unit %
+    pnl_abs    = round((req.exit_price - entry) * lot, 2)
+    pnl_pct    = round((req.exit_price - entry) / entry * 100, 2)
 
     trades.close_trade(jconn, req.trade_id, {
         "exit_premium":   req.exit_price,
