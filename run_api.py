@@ -12,9 +12,11 @@ DuckDB note:
   uses the shared gateway connection (no duck_path argument).
 
 SQLite note:
-  deps.startup() opens the shared journal connection and stores it on
-  app.state.journal.  The scheduler receives this connection directly
-  (journal_conn=app.state.journal) so no per-tick SQLite opens occur.
+  deps.startup() opens TWO SQLite connections:
+    app.state.journal            -- API request handlers (anyio thread pool)
+    app.state.scheduler_journal  -- APScheduler tick (asyncio event loop)
+  The scheduler receives its own dedicated connection so it never shares
+  a sqlite3.Connection object with the API thread pool (thread-safety fix).
 """
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -31,13 +33,17 @@ from optdash.scheduler import create_scheduler
 async def lifespan(app: FastAPI):
     logger.info("Starting OptDash API + Scheduler...")
 
-    # 1. Open DB connections (DuckDB gateway + SQLite journal)
+    # 1. Open DB connections:
+    #    - DuckDB gateway (shared, event-loop safe)
+    #    - SQLite API connection    -> app.state.journal
+    #    - SQLite scheduler conn    -> app.state.scheduler_journal
     await startup(app)
 
-    # 2. Start scheduler -- passes the shared SQLite connection so the
-    #    scheduler never opens a new connection per tick (Fix-M / F-05).
+    # 2. Start scheduler -- uses its own dedicated SQLite connection
+    #    (app.state.scheduler_journal) to avoid cross-thread sqlite3.Connection
+    #    access with the API thread pool (Fix-M proper / F-05).
     scheduler = create_scheduler(
-        journal_conn=app.state.journal,
+        journal_conn=app.state.scheduler_journal,
     )
     scheduler.start()
     app.state.scheduler = scheduler
