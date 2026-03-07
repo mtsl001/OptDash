@@ -2,6 +2,7 @@
 import json
 import sqlite3
 from fastapi import APIRouter, Depends, Query, HTTPException
+from loguru import logger
 from pydantic import BaseModel
 
 from optdash.api.deps import get_journal
@@ -65,6 +66,16 @@ def _hydrate_trade(trade: dict | None) -> dict | None:
             try:
                 result[field] = json.loads(raw)
             except (ValueError, TypeError):
+                # Fix-O (F-07): log malformed JSON so journal corruption is
+                # detectable in logs rather than silently returning empty data.
+                logger.warning(
+                    "_hydrate_trade: failed to parse '{}' for trade_id={} "
+                    "-- raw value: {!r:.120} -- defaulting to {}",
+                    field,
+                    result.get("id"),
+                    raw,
+                    default,
+                )
                 result[field] = default
     return result
 
