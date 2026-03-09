@@ -21,11 +21,30 @@ async def live_feed(
     ws:         WebSocket,
     trade_date: str = Query(...),
     snap_time:  str = Query("LIVE"),
-    underlying: str = Query("NIFTY"),
+    underlying: str = Query(settings.DEFAULT_UNDERLYING),   # F4: honour config
 ):
     await ws.accept()
-    duck    = ws.app.state.duck
-    journal = ws.app.state.journal
+    duck = ws.app.state.duck
+
+    # F2: use the dedicated event-loop SQLite connection.
+    # app.state.journal is shared with FastAPI's anyio thread pool (HTTP
+    # request handlers). sqlite3.Connection is NOT thread-safe; using it
+    # here from the async event loop alongside concurrent HTTP requests
+    # produces silent data races and potential OperationalError crashes.
+    # app.state.scheduler_journal is the connection reserved for all
+    # async / event-loop callers (scheduler tick + this WS handler).
+    journal = ws.app.state.scheduler_journal
+
+    # F4: reject an unknown underlying immediately after accept() so the
+    # client receives a clear error rather than a stream of empty payloads
+    # for the full lifetime of the connection (potentially 30+ minutes).
+    if underlying not in settings.UNDERLYINGS:
+        await ws.send_json({
+            "error": f"Unknown underlying '{underlying}'. "
+                     f"Valid values: {settings.UNDERLYINGS}"
+        })
+        await ws.close()
+        return
 
     logger.info("WS connect: {} {} {}", underlying, trade_date, snap_time)
     try:
@@ -68,7 +87,15 @@ def _build_payload(
     duck, journal, trade_date: str, snap_time: str, underlying: str
 ) -> dict:
     try:
-        env    = get_environment_score(duck, trade_date, snap_time, underlying)
+        # F3: fetch open trades FIRST so direction is available for the gate.
+        # C9 (VEX alignment, 2 pts) only evaluates when direction is passed to
+        # get_environment_score(). Calling without direction made the WS gate
+        # score permanently 0-2 pts lower than the recommender's internal gate.
+        open_t    = trades.get_open_trades(journal, underlying=underlying)
+        direction = open_t[0]["option_type"] if open_t else None
+
+        env    = get_environment_score(duck, trade_date, snap_time, underlying,
+                                       direction=direction)
         gex    = get_net_gex(duck, trade_date, snap_time, underlying)
         coc    = get_coc_latest(duck, trade_date, snap_time, underlying)
         pcr    = get_pcr(duck, trade_date, snap_time, underlying)
@@ -76,7 +103,6 @@ def _build_payload(
         alerts = get_alerts(duck, trade_date, snap_time, underlying)
 
         pending = trades.get_pending_trades(journal, underlying=underlying)
-        open_t  = trades.get_open_trades(journal, underlying=underlying)
 
         return {
             "snap_time":     snap_time,
