@@ -259,7 +259,14 @@ def _minutes_since_entry(entry_snap: str, current_snap: str) -> int:
 
 
 def _snaps_since(entry_snap: str, current_snap: str) -> int:
-    return _minutes_since_entry(entry_snap, current_snap) // 5
+    """Fix TRK-2: derive interval from settings so the expiry snap count
+    stays correct when SCHEDULER_INTERVAL_SECONDS is changed.
+    Hardcoded // 5 produced a count 2x too high at 10-min intervals,
+    causing AI_EXPIRY_MAX_SNAPS to trigger at half the intended wall-clock
+    duration and expiring valid recommendations prematurely.
+    """
+    interval_mins = max(1, settings.SCHEDULER_INTERVAL_SECONDS // 60)
+    return _minutes_since_entry(entry_snap, current_snap) // interval_mins
 
 
 def _consecutive_no_go_count(jconn: sqlite3.Connection, trade_id: int) -> int:
