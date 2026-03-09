@@ -4,8 +4,10 @@ All tables use CREATE TABLE IF NOT EXISTS so init_db() is safely idempotent
 and can be called on every fresh connection without side effects.
 
 For existing databases, _run_migrations() uses ALTER TABLE to add new columns;
-SQLite silently raises OperationalError on duplicate columns which we catch.
+SQLite raises OperationalError("duplicate column name") on re-runs, which is
+caught and silenced. All other errors propagate so startup fails loudly.
 """
+import sqlite3
 
 CREATE_TRADES = """
 CREATE TABLE IF NOT EXISTS trades (
@@ -129,14 +131,14 @@ CREATE INDEX IF NOT EXISTS idx_shadow_snaps_shadow_id ON shadow_snaps(shadow_id)
 # ----------------------------
 # 1. Add the column to CREATE_TRADES above (for fresh installs).
 # 2. Add a corresponding ALTER TABLE line here (for existing databases).
-# 3. Never remove or reorder existing entries — they are idempotent no-ops
+# 3. Never remove or reorder existing entries -- they are idempotent no-ops
 #    on databases that already have the column.
 # ---------------------------------------------------------------------------
 _MIGRATIONS = [
-    # ── original column ────────────────────────────────────────────────────
+    # -- original column -------------------------------------------------------
     "ALTER TABLE trades ADD COLUMN session            TEXT",
 
-    # ── columns added after initial schema release ─────────────────────────
+    # -- columns added after initial schema release ----------------------------
     # Fix-A: these columns were present in CREATE_TRADES DDL but missing
     # from _MIGRATIONS, causing OperationalError on upgrade installs.
     "ALTER TABLE trades ADD COLUMN actual_entry_price REAL",
@@ -158,7 +160,7 @@ _MIGRATIONS = [
 
 def init_db(conn) -> None:
     """Create all tables and indexes, then apply any pending column migrations.
-    Idempotent — safe to call on every new connection.
+    Idempotent -- safe to call on every new connection.
     """
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(
@@ -175,14 +177,26 @@ def init_db(conn) -> None:
 def _run_migrations(conn) -> None:
     """Apply ALTER TABLE migrations for existing databases.
 
-    Each migration is attempted once. Duplicate-column errors are silently
-    ignored — this makes every entry idempotent on any database state.
-    Other unexpected errors are also suppressed to avoid blocking startup;
-    they will surface as runtime errors on first use of the missing column.
+    Each migration is attempted once. Only OperationalError("duplicate column
+    name") is silenced -- this is the expected benign result when the column
+    already exists on a re-run, making every entry idempotent.
+
+    Fix-P1-13: all other OperationalError subtypes (table locked, disk full,
+    wrong column type, etc.) previously fell through the bare `except Exception:
+    pass` and were silently swallowed. The column then simply did not exist;
+    the first INSERT/SELECT against it raised a cryptic runtime
+    OperationalError with no trace back to the failed migration.
+    Now they raise RuntimeError at startup so the failure is loud and
+    immediately traceable to the offending migration statement.
     """
     for sql in _MIGRATIONS:
         try:
             conn.execute(sql)
             conn.commit()
-        except Exception:
-            pass  # Column already exists (expected on re-runs) or other benign error
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" in str(e).lower():
+                pass  # idempotent -- column already exists on a re-run
+            else:
+                raise RuntimeError(
+                    f"Migration failed (non-duplicate error): {sql!r}\n{e}"
+                ) from e
