@@ -120,17 +120,29 @@ def update_status(
 def accept_trade(
     conn:               sqlite3.Connection,
     trade_id:           int,
-    snap_time:          str,
+    accept_snap_time:   str,
     actual_entry_price: float | None = None,
 ) -> None:
+    """Accept a generated trade recommendation and record the acceptance snap.
+
+    Fix-P1-14: snap_time (the AI generation snap) is intentionally NOT
+    updated here. It is set at INSERT time and must remain immutable so that:
+      - build_theta_sl_series() anchors the theta-SL curve at generation time.
+      - The generation-to-acceptance delta (snap_time vs accept_snap_time)
+        is preserved as a learning signal for the AI feedback loop.
+      - Session attribution based on snap_time is always the generation
+        session, not the (potentially different) acceptance session.
+
+    accept_snap_time is written to the dedicated column added in schema.py.
+    """
     conn.execute(
         """UPDATE trades
            SET status='ACCEPTED',
                actual_entry_price=COALESCE(?, entry_premium),
-               snap_time=?,
+               accept_snap_time=?,
                updated_at=datetime('now')
            WHERE id=?""",
-        [actual_entry_price, snap_time, trade_id]
+        [actual_entry_price, accept_snap_time, trade_id]
     )
     conn.commit()
 
