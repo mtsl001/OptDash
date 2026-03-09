@@ -130,7 +130,12 @@ def track_open_positions(
             },
         )
 
-        # Write snap
+        # Write snap — P6-E: commit=False batches all snaps for this tick.
+        # Auto-close path (trades.close_trade, commit=True default) will flush
+        # the buffered snap + the CLOSED update together atomically if the
+        # position exits. For positions that stay open, the single jconn.commit()
+        # after the loop issues one WAL flush for all remaining snaps — replacing
+        # the previous N individual flushes (one per open trade per tick).
         snaps.insert_snap(jconn, {
             "trade_id":        trade["id"],
             "snap_time":       snap_time,
@@ -148,7 +153,7 @@ def track_open_positions(
             "vega_pnl":        pnl_attr["vega_pnl"],
             "theta_pnl":       pnl_attr["theta_pnl"],
             "unexplained":     pnl_attr["unexplained"],
-        })
+        }, commit=False)
 
         # Auto-close logic
         exit_reason = None
@@ -172,6 +177,8 @@ def track_open_positions(
             exit_reason = ExitReason.IV_CRUSH.value
 
         if exit_reason:
+            # close_trade() uses commit=True (default): flushes the buffered
+            # insert_snap row + this CLOSED update in one atomic write.
             trades.close_trade(jconn, trade["id"], {
                 "exit_premium":   ltp,
                 "exit_snap_time": snap_time,
@@ -183,6 +190,12 @@ def track_open_positions(
                 "Auto-closed {} {} @ {:.1f} | reason={} | pnl={:+.1f}%",
                 underlying, opt_type, ltp, exit_reason, pnl_pct
             )
+
+    # P6-E: single WAL flush for all snaps buffered during this tick.
+    # Positions that auto-closed above were already flushed by close_trade();
+    # this commit covers the remaining open-position snaps — one disk sync
+    # per tick regardless of how many positions are being tracked.
+    jconn.commit()
 
 
 def expire_stale_recommendations(
