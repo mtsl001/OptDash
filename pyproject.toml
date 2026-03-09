@@ -27,6 +27,10 @@ dependencies = [
     # explicit pin raises ModuleNotFoundError on the first scheduler tick.
     # <20.0 guards against an unvalidated major-version jump.
     "pyarrow>=15.0.0,<20.0",
+    # filelock provides a cross-platform advisory file lock used by pipeline/writer.py
+    # to serialise concurrent read-merge-write access to the same Parquet file.
+    # On POSIX, fcntl would suffice; filelock is used for Windows compatibility.
+    "filelock>=3.13",
     "numpy>=1.26.4",
     "scipy>=1.13.0",
     "py_vollib>=1.0.1",

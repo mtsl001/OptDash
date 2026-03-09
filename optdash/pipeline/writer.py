@@ -5,8 +5,20 @@ Because Parquet does not support native append, the writer uses a
 read-merge-rewrite pattern:
 
   1. If a file already exists for today's underlying, load it.
-  2. Drop any existing rows for the incoming snap_time (idempotent re-runs).
+  2. Drop any existing rows for ALL incoming snap_times (idempotent re-runs).
   3. Concat the new rows, sort by snap_time, write back atomically.
+
+Atomicity
+---------
+Writes go to a ``.tmp`` sibling first, then Path.replace() performs an
+atomic rename (POSIX syscall) so DuckDB always sees either the previous
+complete file or the new complete file -- never a partial write.
+
+Concurrency
+-----------
+filelock.FileLock serialises concurrent read-merge-write access on a
+``.lock`` sibling.  This guards against scheduler-restart overlaps where
+two writer instances could otherwise race on the same file.
 
 File layout
 -----------
@@ -35,6 +47,7 @@ from pathlib import Path
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from filelock import FileLock
 from loguru import logger
 
 PROCESSED_SUBDIR   = "processed"
@@ -72,13 +85,33 @@ def write_snap(
     path = parquet_path(data_root, trade_date, underlying)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Advisory lock: serialises concurrent read-merge-write on the same file.
+    # Timeout=30 s: if another writer holds the lock for >30 s something is
+    # badly wrong; let the exception propagate rather than stacking up writers.
+    lock_path = path.with_suffix(".lock")
+    with FileLock(str(lock_path), timeout=30):
+        _write_snap_locked(path, snap_df, trade_date, underlying)
+
+
+def _write_snap_locked(
+    path:       Path,
+    snap_df:    pd.DataFrame,
+    trade_date: str,
+    underlying: str,
+) -> None:
+    """Core read-merge-write logic, called with the file lock already held."""
+    tmp_path = path.with_suffix(".tmp")
     try:
         if path.exists():
-            existing  = pd.read_parquet(path)
-            snap_time = snap_df["snap_time"].iloc[0]
-            # Drop previous rows for this snap_time so retries are idempotent.
-            existing  = existing[existing["snap_time"] != snap_time]
-            merged    = pd.concat([existing, snap_df], ignore_index=True)
+            existing = pd.read_parquet(path)
+            # F3 fix: drop ALL incoming snap_times, not just iloc[0].
+            # A backfill/retry batch may cover multiple snap windows; dropping
+            # only the first snap_time left duplicates for the rest.
+            incoming_snaps = set(snap_df["snap_time"].unique())
+            existing = existing[
+                ~existing["snap_time"].isin(incoming_snaps)
+            ]
+            merged = pd.concat([existing, snap_df], ignore_index=True)
         else:
             merged = snap_df.copy()
 
@@ -88,17 +121,23 @@ def write_snap(
         )
 
         table = pa.Table.from_pandas(merged, preserve_index=False)
+
+        # F2 fix: write to .tmp then atomically rename.
+        # Path.replace() is an atomic rename syscall on POSIX; DuckDB always
+        # sees either the previous complete file or this new complete file.
         pq.write_table(
-            table, path,
+            table, tmp_path,
             compression="snappy",
             write_statistics=True,   # enables min/max pushdown in DuckDB
         )
+        tmp_path.replace(path)   # atomic on POSIX (same filesystem)
+
         logger.debug(
             "[Writer] {}/{} -- {} rows -> {}",
             trade_date, underlying, len(merged), path.name,
         )
 
-    except Exception as e:
-        logger.error(
-            "[Writer] Failed to write {}/{}: {}", trade_date, underlying, e
-        )
+    except Exception:
+        # Never leave a partial .tmp behind; the original file is untouched.
+        tmp_path.unlink(missing_ok=True)
+        raise
