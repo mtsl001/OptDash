@@ -5,7 +5,7 @@ from loguru import logger
 from optdash.config import settings
 from optdash.models import ExitReason, ShadowOutcome, TradeStatus
 from optdash.ai.journal import trades, shadow
-from optdash.ai.tracker import _fetch_strike_current
+from optdash.analytics.query import fetch_strike_current as _fetch_strike_current
 from optdash.ai.shadow_tracker import _classify_shadow_outcome
 
 
@@ -32,7 +32,7 @@ def eod_force_close(
     open_trades = trades.get_open_trades(jconn)
     snap_time   = settings.EOD_FORCE_CLOSE_TIME
 
-    # ── Read phase: pre-fetch all LTPs before any writes ─────────────────────
+    # ── Read phase: pre-fetch all LTPs before any writes ───────────────────────
     # A DuckDB error mid-loop cannot interleave with half-written journal rows
     # if we fetch everything first and write in a separate, guarded phase.
     close_payloads: list[tuple[dict, dict]] = []

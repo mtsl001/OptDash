@@ -13,7 +13,7 @@ from loguru import logger
 from optdash.config import settings
 from optdash.models import ShadowOutcome
 from optdash.ai.journal import shadow
-from optdash.ai.tracker import _fetch_strike_current
+from optdash.analytics.query import fetch_strike_current as _fetch_strike_current
 
 
 def track_shadow_positions(

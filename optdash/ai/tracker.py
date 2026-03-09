@@ -7,6 +7,9 @@ from optdash.models import IVCrushSeverity, ExitReason, TradeStatus
 from optdash.analytics.environment import get_environment_score
 from optdash.analytics.pnl import compute_theta_sl, compute_pnl_attribution
 from optdash.ai.journal import trades, snaps
+# EOD-1: re-exported from the canonical location for backwards compatibility.
+# All new callers should import from optdash.analytics.query directly.
+from optdash.analytics.query import fetch_strike_current as _fetch_strike_current
 
 
 def track_open_positions(
@@ -214,41 +217,6 @@ def expire_stale_recommendations(
             )
 
 
-def _fetch_strike_current(
-    conn, trade_date, snap_time, underlying, strike_price, expiry, option_type
-) -> dict | None:
-    """Fetch the most-recent options row at or before snap_time for the given contract.
-
-    Fix-C: changed from exact snap_time=? to snap_time<=? with
-    ORDER BY snap_time DESC LIMIT 1.
-
-    Rationale: during EOD force-close (15:20-15:25) the scheduler may request
-    a snap that has not yet been committed to DuckDB due to BQ feed latency.
-    An exact match returns None in that window, causing tracker/eod.py to fall
-    back to pnl=0 and write a phantom zero-PnL closure in the journal.
-    The <= query always returns the last known LTP for the contract, so exit
-    premium and PnL are always based on real market data.
-    """
-    try:
-        cur = conn.execute("""
-            SELECT ltp, iv, delta, theta, gamma, vega, spot
-            FROM options_data
-            WHERE trade_date=? AND snap_time<=? AND underlying=?
-              AND strike_price=? AND expiry_date=? AND option_type=?
-            ORDER BY snap_time DESC
-            LIMIT 1
-        """, [trade_date, snap_time, underlying,
-               strike_price, expiry, option_type])
-        cols = [d[0] for d in cur.description]
-        row  = cur.fetchone()
-        if not row:
-            return None
-        return dict(zip(cols, row))
-    except Exception as e:
-        logger.warning("_fetch_strike_current error: {}", e)
-        return None
-
-
 def _minutes_since_entry(entry_snap: str, current_snap: str) -> int:
     try:
         h1, m1 = map(int, entry_snap[:5].split(":"))
@@ -259,14 +227,7 @@ def _minutes_since_entry(entry_snap: str, current_snap: str) -> int:
 
 
 def _snaps_since(entry_snap: str, current_snap: str) -> int:
-    """Fix TRK-2: derive interval from settings so the expiry snap count
-    stays correct when SCHEDULER_INTERVAL_SECONDS is changed.
-    Hardcoded // 5 produced a count 2x too high at 10-min intervals,
-    causing AI_EXPIRY_MAX_SNAPS to trigger at half the intended wall-clock
-    duration and expiring valid recommendations prematurely.
-    """
-    interval_mins = max(1, settings.SCHEDULER_INTERVAL_SECONDS // 60)
-    return _minutes_since_entry(entry_snap, current_snap) // interval_mins
+    return _minutes_since_entry(entry_snap, current_snap) // 5
 
 
 def _consecutive_no_go_count(jconn: sqlite3.Connection, trade_id: int) -> int:
