@@ -17,7 +17,8 @@ def build_learning_report(conn: sqlite3.Connection, days: int = 30) -> dict:
     """
     overall = get_session_stats(conn)
 
-    # By underlying
+    # By underlying — P4-F13: scoped to the same `days` window as shadow stats
+    # so live vs shadow win-rates are directly comparable (previously all-time).
     underlyings_rows = conn.execute(
         """SELECT underlying,
                   COUNT(*),
@@ -25,7 +26,9 @@ def build_learning_report(conn: sqlite3.Connection, days: int = 30) -> dict:
                   AVG(final_pnl_pct)
            FROM trades
            WHERE status='CLOSED' AND final_pnl_pct IS NOT NULL
-           GROUP BY underlying"""
+             AND trade_date >= date('now', ?)
+           GROUP BY underlying""",
+        [f"-{days} days"]
     ).fetchall()
     by_underlying = [
         {
@@ -38,7 +41,7 @@ def build_learning_report(conn: sqlite3.Connection, days: int = 30) -> dict:
         for r in underlyings_rows
     ]
 
-    # By direction
+    # By direction — P4-F13
     direction_rows = conn.execute(
         """SELECT option_type,
                   COUNT(*),
@@ -46,7 +49,9 @@ def build_learning_report(conn: sqlite3.Connection, days: int = 30) -> dict:
                   AVG(final_pnl_pct)
            FROM trades
            WHERE status='CLOSED' AND final_pnl_pct IS NOT NULL
-           GROUP BY option_type"""
+             AND trade_date >= date('now', ?)
+           GROUP BY option_type""",
+        [f"-{days} days"]
     ).fetchall()
     by_direction = [
         {
@@ -58,7 +63,7 @@ def build_learning_report(conn: sqlite3.Connection, days: int = 30) -> dict:
         for r in direction_rows
     ]
 
-    # By session
+    # By session — P4-F13
     session_rows = conn.execute(
         """SELECT session,
                   COUNT(*),
@@ -67,7 +72,9 @@ def build_learning_report(conn: sqlite3.Connection, days: int = 30) -> dict:
            FROM trades
            WHERE status='CLOSED' AND final_pnl_pct IS NOT NULL
              AND session IS NOT NULL
-           GROUP BY session"""
+             AND trade_date >= date('now', ?)
+           GROUP BY session""",
+        [f"-{days} days"]
     ).fetchall()
     by_session = [
         {
@@ -79,7 +86,10 @@ def build_learning_report(conn: sqlite3.Connection, days: int = 30) -> dict:
         for r in session_rows
     ]
 
-    # By exit reason
+    # By exit reason — intentionally all-time: exit reason distribution is a
+    # structural metric that benefits from the full trade history, not a
+    # rolling window. A 30-day window on a low-frequency strategy would
+    # produce misleadingly sparse per-reason counts.
     exit_rows = conn.execute(
         """SELECT exit_reason, COUNT(*), AVG(final_pnl_pct)
            FROM trades WHERE status='CLOSED'
@@ -95,8 +105,13 @@ def build_learning_report(conn: sqlite3.Connection, days: int = 30) -> dict:
     gate_buckets       = get_threshold_performance(
         conn, "gate_score", [(0, 5), (5, 7), (7, 8), (8, 9), (9, 12)]
     )
-    sscore_buckets     = get_threshold_performance(
-        conn, "s_score", [(0, 8), (8, 12), (12, 16), (16, 100)]
+    # P4-F12: realigned to the full 0–150 STAR scale.
+    # Old top bucket (16, 100) excluded all STAR-4 trades (s_score 100–150),
+    # so the best setups were invisible in threshold analysis.
+    # New buckets align with STAR2=60, STAR3=80, STAR4=100 thresholds;
+    # 151 is the exclusive upper bound (max possible s_score is 150).
+    sscore_buckets = get_threshold_performance(
+        conn, "s_score", [(0, 60), (60, 80), (80, 100), (100, 151)]
     )
 
     # Rejection reason breakdown
@@ -110,7 +125,6 @@ def build_learning_report(conn: sqlite3.Connection, days: int = 30) -> dict:
 
     # Shadow comparison
     shadows        = get_shadow_history(conn, days=days)
-    shadow_wins    = sum(1 for s in shadows if (s.get("final_pnl_pct") or 0) > 0)
     shadow_total   = len(shadows)
     shadow_avg_pnl = (
         round(sum(s.get("final_pnl_pct") or 0 for s in shadows) / shadow_total, 2)
@@ -120,6 +134,17 @@ def build_learning_report(conn: sqlite3.Connection, days: int = 30) -> dict:
     for s in shadows:
         o = s.get("outcome", "UNKNOWN")
         shadow_outcomes[o] = shadow_outcomes.get(o, 0) + 1
+
+    # P4-F14a: replaced shadow_wins (pnl > 0 — inflated by noise trades of
+    # +0.1%) with outcome-based accuracy metrics.
+    # rejection_accuracy = GOOD_SKIP / (GOOD_SKIP + CLEAN_MISS)
+    #   Only decided outcomes count; RISKY_MISS / BREAK_EVEN are excluded
+    #   from the denominator so ambiguous outcomes do not dilute the signal.
+    # clean_miss_rate = CLEAN_MISS / shadow_total
+    #   What fraction of all shadows were costly rejections (gate was wrong)?
+    shadow_good_skips    = shadow_outcomes.get("GOOD_SKIP", 0)
+    shadow_clean_misses  = shadow_outcomes.get("CLEAN_MISS", 0)
+    shadow_total_decided = shadow_good_skips + shadow_clean_misses
 
     return {
         "overall":            overall,
@@ -133,9 +158,14 @@ def build_learning_report(conn: sqlite3.Connection, days: int = 30) -> dict:
         "rejection_analysis": rejection_analysis,
         "shadow_summary": {
             "total":    shadow_total,
-            "wins":     shadow_wins,
-            "win_rate": round(shadow_wins / shadow_total * 100, 1) if shadow_total else None,
             "avg_pnl":  shadow_avg_pnl,
             "outcomes": shadow_outcomes,
+            # Outcome-based accuracy — replaces raw pnl>0 shadow_wins count.
+            "rejection_accuracy": round(
+                shadow_good_skips / shadow_total_decided * 100, 1
+            ) if shadow_total_decided else None,
+            "clean_miss_rate": round(
+                shadow_clean_misses / shadow_total * 100, 1
+            ) if shadow_total else None,
         },
     }
