@@ -42,11 +42,33 @@ def create_shadow(conn: sqlite3.Connection, data: dict, commit: bool = True) -> 
 
 
 def get_active_shadows(conn: sqlite3.Connection, trade_date: str) -> list[dict]:
+    """Return open shadows for the given trade_date only.
+
+    Used by shadow_tracker.py for intraday tracking — prior-day shadows
+    are not trackable intraday since historical DuckDB data for prior days
+    is not in the active rolling view. For EOD orphan finalization, use
+    get_all_unclosed_shadows() instead.
+    """
     cur = conn.execute(
         """SELECT * FROM shadow_trades
            WHERE trade_date=? AND is_closed=0
            ORDER BY id""",
         [trade_date]
+    )
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def get_all_unclosed_shadows(conn: sqlite3.Connection) -> list[dict]:
+    """Return ALL open shadows regardless of trade_date.
+
+    P4-F10: used by eod.finalize_all_shadows() to sweep orphan shadows from
+    prior days when the app crashed before EOD. Those shadows kept is_closed=0
+    indefinitely under the old date-filtered get_active_shadows() call,
+    silently inflating shadow_total and corrupting learning win-rate stats.
+    """
+    cur = conn.execute(
+        "SELECT * FROM shadow_trades WHERE is_closed=0 ORDER BY id"
     )
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
