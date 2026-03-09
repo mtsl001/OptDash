@@ -1,10 +1,11 @@
 """AI endpoints - recommendation, accept/reject, position, journal, learning."""
 import json
 import sqlite3
+import time
 from typing import Annotated
 from fastapi import APIRouter, Depends, Query, HTTPException
 from loguru import logger
-from pydantic import BaseModel, StringConstraints
+from pydantic import BaseModel, StringConstraints, field_validator
 
 from optdash.api.deps import get_journal
 from optdash.ai.journal import trades, shadow, snaps
@@ -34,6 +35,16 @@ class AcceptRequest(BaseModel):
     snap_time:          SnapTime
     actual_entry_price: float | None = None
 
+    # F5: reject a zero or negative entry price at the API boundary.
+    # A zero entry would cause pnl_pct = (exit - 0) / 0 -> ZeroDivisionError
+    # in /close-trade; a negative entry inverts PnL sign silently.
+    @field_validator("actual_entry_price")
+    @classmethod
+    def _positive_price(cls, v: float | None) -> float | None:
+        if v is not None and v <= 0:
+            raise ValueError("actual_entry_price must be a positive number")
+        return v
+
 
 class RejectRequest(BaseModel):
     trade_id: int
@@ -45,6 +56,14 @@ class CloseRequest(BaseModel):
     trade_id:   int
     exit_price: float
     snap_time:  SnapTime
+
+
+# -- Learning report TTL cache ------------------------------------------------
+# F6: build_learning_report() runs 8+ SQL aggregations per call. Cache results
+# for REPORT_TTL seconds to avoid recomputing on every dashboard poll or fast
+# refresh. Keyed by `days` so different lookback windows cache independently.
+_report_cache: dict[int, dict] = {}
+_REPORT_TTL   = 60   # seconds
 
 
 # -- Response helpers ---------------------------------------------------------
@@ -213,11 +232,24 @@ def close_position(
         raise HTTPException(400, f"Trade not open (status='{trade['status']}')")
 
     underlying = trade["underlying"]
-    entry      = trade["actual_entry_price"] or trade["entry_premium"]
-    lot        = settings.LOT_SIZES.get(underlying, 1)
+
+    # F5: guard against None / 0 entry price before any arithmetic.
+    # actual_entry_price is NULL when the trader accepted at the AI's
+    # entry_premium estimate; entry_premium should always be set but could
+    # be 0.0 in a corrupted row. Either case would produce ZeroDivisionError
+    # or a meaningless negative PnL -- surface it as a 400 instead.
+    entry = trade.get("actual_entry_price") or trade.get("entry_premium")
+    if not entry:
+        raise HTTPException(
+            400,
+            "Cannot compute PnL: no valid entry price on record for this trade. "
+            "Check actual_entry_price / entry_premium in the journal."
+        )
+
+    lot     = settings.LOT_SIZES.get(underlying, 1)
     # Fix-K (F-01): pnl_abs is monetary (point_diff * lot); pnl_pct stays per-unit %
-    pnl_abs    = round((req.exit_price - entry) * lot, 2)
-    pnl_pct    = round((req.exit_price - entry) / entry * 100, 2)
+    pnl_abs = round((req.exit_price - entry) * lot, 2)
+    pnl_pct = round((req.exit_price - entry) / entry * 100, 2)
 
     trades.close_trade(jconn, req.trade_id, {
         "exit_premium":   req.exit_price,
@@ -255,4 +287,13 @@ def learning_report(
     days: int = Query(30, ge=7, le=365),
     jconn: sqlite3.Connection = Depends(get_journal),
 ):
-    return build_learning_report(jconn, days=days)
+    # F6: return cached result if fresh enough.
+    # build_learning_report() runs 8+ SQL aggregations; recomputing on every
+    # poll is wasteful at 5000+ trades. 60s TTL is fine for a report used
+    # for intraday or next-day strategy review -- it is never time-critical.
+    cached = _report_cache.get(days)
+    if cached and (time.monotonic() - cached["ts"]) < _REPORT_TTL:
+        return cached["data"]
+    data = build_learning_report(jconn, days=days)
+    _report_cache[days] = {"data": data, "ts": time.monotonic()}
+    return data
