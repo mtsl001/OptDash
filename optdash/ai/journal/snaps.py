@@ -2,12 +2,14 @@
 import sqlite3
 
 # ---------------------------------------------------------------------------
-# Allowed column set -- validated before f-string SQL construction (F12)
+# Column whitelist — guards insert_snap() against f-string SQL injection via
+# caller-controlled dict keys (F12).  Values remain bound as SQL parameters.
 # ---------------------------------------------------------------------------
 _ALLOWED_SNAP_COLS: frozenset[str] = frozenset({
     "trade_id", "snap_time", "ltp", "pnl_abs", "pnl_pct",
-    "sl_adjusted", "trail_sl", "gate_status", "iv_current",
-    "delta_current", "theta_current", "spot_current",
+    "sl_adjusted", "theta_sl_status", "iv", "iv_crush",
+    "gate_score", "gate_verdict", "delta_pnl", "gamma_pnl",
+    "vega_pnl", "theta_pnl", "unexplained",
 })
 
 
@@ -18,18 +20,16 @@ def insert_snap(
 ) -> None:
     """Insert a position snap row.
 
-    Raises ValueError if *data* contains any key not in _ALLOWED_SNAP_COLS
-    (prevents f-string SQL injection via unvalidated dict keys).
-
     commit=True  (default): commit immediately -- safe for standalone calls.
-    commit=False: leave the INSERT uncommitted so the scheduler tick loop
-    can batch all N snaps in one transaction and commit once at the end,
-    reducing WAL syncs from N to 1 per tick (F13 fix). If the loop
-    crashes mid-way, no partial tick data is committed.
+    commit=False: leave the INSERT in the current implicit transaction so the
+    caller can batch all snaps for a tick and issue a single jconn.commit()
+    afterwards -- one WAL flush per tick instead of N (F13).
     """
+    # F12: validate column names before interpolating into the SQL f-string.
     unknown = set(data.keys()) - _ALLOWED_SNAP_COLS
     if unknown:
         raise ValueError(f"insert_snap: unknown column(s): {unknown}")
+
     cols         = ", ".join(data.keys())
     placeholders = ", ".join(["?"] * len(data))
     conn.execute(
@@ -50,19 +50,21 @@ def get_snaps_for_trade(conn: sqlite3.Connection, trade_id: int) -> list[dict]:
 
 
 def get_peak_ltp(conn: sqlite3.Connection, trade_id: int) -> float | None:
-    """Return the peak LTP recorded across all snaps for a trade.
+    """Return the highest LTP recorded for *trade_id*, or None if no snaps exist.
 
-    Returns None (not 0.0) when no snaps exist yet, so callers can
-    distinguish 'no snaps yet' from 'peak LTP was genuinely 0.0' (a
-    deeply OTM worthless option). The tracker uses this to seed
-    peak_ltp with the current tick's ltp on the very first snap rather
-    than anchoring the trailing stop at 0.0 * 0.90 = 0.0 (P6-F6 fix).
+    Part-6-F6: returns None rather than 0.0 when no snaps have been written
+    yet.  0.0 is a semantically valid LTP (deeply-OTM option at expiry) so
+    the two states must be distinguishable.  Callers handle the first-tick
+    case explicitly:
+
+        raw_peak = snaps.get_peak_ltp(jconn, trade["id"])
+        peak_ltp = raw_peak if raw_peak is not None else ltp
     """
     row = conn.execute(
         "SELECT MAX(ltp) FROM position_snaps WHERE trade_id=?", [trade_id]
     ).fetchone()
     if row is None or row[0] is None:
-        return None   # no snaps yet -- caller handles the first-tick case
+        return None          # no snaps written yet for this trade
     return float(row[0])
 
 

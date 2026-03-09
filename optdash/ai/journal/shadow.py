@@ -2,32 +2,34 @@
 import sqlite3
 
 # ---------------------------------------------------------------------------
-# Allowed column sets -- validated before any f-string SQL construction (F12)
+# Column whitelists — guard f-string SQL builders against caller-controlled
+# dict keys (F12).  Values are still bound as SQL parameters (?); the risk
+# is in the *column names*, which must be validated before interpolation.
 # ---------------------------------------------------------------------------
 _ALLOWED_SHADOW_COLS: frozenset[str] = frozenset({
-    "trade_id", "trade_date", "underlying", "option_type", "strike_price",
-    "expiry_date", "entry_premium", "sl_price", "target_price",
-    "entry_snap_time", "is_closed", "final_pnl_pct", "outcome", "closed_snap",
+    "trade_id", "trade_date", "underlying", "option_type",
+    "strike_price", "expiry_date", "entry_premium",
+    "final_pnl_pct", "outcome", "closed_snap", "is_closed",
 })
 
 _ALLOWED_SHADOW_SNAP_COLS: frozenset[str] = frozenset({
-    "shadow_id", "snap_time", "ltp", "pnl_pct", "hit_sl", "hit_tgt",
+    "shadow_id", "snap_time", "ltp", "pnl_pct",
+    "hit_sl", "hit_target",
 })
 
 
 def create_shadow(conn: sqlite3.Connection, data: dict, commit: bool = True) -> int:
     """Insert a new shadow trade record.
 
-    Raises ValueError if *data* contains any key not in _ALLOWED_SHADOW_COLS
-    (prevents f-string SQL injection via unvalidated dict keys).
-
     commit=True  (default): commit immediately -- safe for standalone calls.
     commit=False: leave the INSERT in the current implicit transaction so the
     caller can bundle it with other writes (e.g. reject_trade) and commit once.
     """
+    # F12: validate column names before interpolating into the SQL f-string.
     unknown = set(data.keys()) - _ALLOWED_SHADOW_COLS
     if unknown:
         raise ValueError(f"create_shadow: unknown column(s): {unknown}")
+
     cols         = ", ".join(data.keys())
     placeholders = ", ".join(["?"] * len(data))
     cur = conn.execute(
@@ -57,18 +59,16 @@ def insert_shadow_snap(
 ) -> None:
     """Insert a shadow position snap.
 
-    Raises ValueError if *data* contains any key not in _ALLOWED_SHADOW_SNAP_COLS.
-
     commit=True  (default): commit immediately -- safe for standalone calls.
-    commit=False: leave the INSERT uncommitted so the caller can bundle it
-    with close_shadow() into one atomic transaction (F16 fix). Since
-    close_shadow() always commits, using commit=False here + calling
-    close_shadow() next makes both writes atomic: a crash between them
-    leaves neither committed rather than leaving an orphan snap row.
+    commit=False: leave the INSERT in the current implicit transaction so the
+    caller can bundle it with close_shadow() and commit once, making the
+    snap write and the is_closed flag update atomic (F16).
     """
+    # F12: validate column names before interpolating into the SQL f-string.
     unknown = set(data.keys()) - _ALLOWED_SHADOW_SNAP_COLS
     if unknown:
         raise ValueError(f"insert_shadow_snap: unknown column(s): {unknown}")
+
     cols         = ", ".join(data.keys())
     placeholders = ", ".join(["?"] * len(data))
     conn.execute(
@@ -94,14 +94,10 @@ def get_shadow_history(
     days: int = 30,
     underlying: str | None = None,
 ) -> list[dict]:
-    """Return closed shadow trades joined to their parent trade metadata.
-
-    Uses LEFT JOIN (not INNER JOIN) so orphaned shadows -- where the parent
-    trade row was manually deleted or CASCADE failed before FK enforcement
-    was enabled -- are still included rather than silently excluded.
-    Consumers use .get() with fallbacks for all joined fields so None
-    values from the left join are handled gracefully.
-    """
+    # Part-6-F7: LEFT JOIN so orphaned shadow rows (parent trade manually
+    # deleted before FK enforcement was active) are included in the history
+    # rather than silently dropped, which would understate shadow_total in
+    # the learning report.
     q = """SELECT st.*, t.narrative, t.gate_score, t.confidence
            FROM shadow_trades st
            LEFT JOIN trades t ON t.id = st.trade_id
