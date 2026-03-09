@@ -1,4 +1,4 @@
-"""Cost-of-Carry analytics — CoC velocity, ATM OBI, Futures OBI."""
+"""Cost-of-Carry analytics -- CoC velocity, ATM OBI, Futures OBI."""
 import duckdb
 from loguru import logger
 from optdash.config import settings
@@ -63,26 +63,46 @@ def get_coc_series(conn: duckdb.DuckDBPyConnection, trade_date: str, underlying:
 
 def get_atm_obi(conn: duckdb.DuckDBPyConnection, trade_date: str,
                 snap_time: str, underlying: str) -> float:
-    """ATM options order book imbalance (CE vs PE bid/ask sizes at ATM)."""
+    """ATM options order book imbalance (CE vs PE bid/ask sizes at ATM).
+
+    F12 fix: replaced ORDER BY dist LIMIT 4 with a two-CTE approach:
+      1. spot_cte -- current spot price
+      2. min_dist -- exact minimum distance from spot to any TIER1 strike
+    Only rows where ABS(strike - spot) == min_dist are selected, guaranteeing
+    exactly 1 CE row + 1 PE row at the closest strike regardless of how many
+    Parquet rows exist per option at that strike. Previously LIMIT 4 could
+    return 3 CE + 1 PE (or 4 CE + 0 PE) when spot sat on a strike boundary
+    or when one option type had more rows than the other, skewing OBI.
+    """
     try:
         row = conn.execute("""
             WITH spot_cte AS (
                 SELECT AVG(spot) AS spot FROM options_data
                 WHERE trade_date=? AND snap_time=? AND underlying=?
             ),
-            atm_strikes AS (
-                SELECT o.*, ABS(o.strike_price - s.spot) AS dist
+            min_dist AS (
+                SELECT MIN(ABS(o.strike_price - s.spot)) AS md
                 FROM options_data o, spot_cte s
                 WHERE o.trade_date=? AND o.snap_time=? AND o.underlying=?
                   AND o.expiry_tier = 'TIER1'
-                ORDER BY dist LIMIT 4
+            ),
+            atm AS (
+                SELECT o.option_type, o.bid_qty, o.ask_qty
+                FROM options_data o, spot_cte s, min_dist m
+                WHERE o.trade_date=? AND o.snap_time=? AND o.underlying=?
+                  AND o.expiry_tier = 'TIER1'
+                  AND ABS(o.strike_price - s.spot) = m.md
             )
             SELECT
                 SUM(CASE WHEN option_type='CE' THEN (bid_qty - ask_qty) ELSE 0 END) AS ce_flow,
                 SUM(CASE WHEN option_type='PE' THEN (bid_qty - ask_qty) ELSE 0 END) AS pe_flow,
                 SUM(bid_qty + ask_qty) AS total_qty
-            FROM atm_strikes
-        """, [trade_date, snap_time, underlying, trade_date, snap_time, underlying]).fetchone()
+            FROM atm
+        """, [
+            trade_date, snap_time, underlying,   # spot_cte
+            trade_date, snap_time, underlying,   # min_dist
+            trade_date, snap_time, underlying,   # atm
+        ]).fetchone()
         if not row or not row[2]:
             return 0.0
         return round(((row[0] or 0) - (row[1] or 0)) / (row[2] or 1), 4)
@@ -113,7 +133,7 @@ def get_futures_obi(conn: duckdb.DuckDBPyConnection, trade_date: str,
 
 def _compute_vcoc(conn: duckdb.DuckDBPyConnection, trade_date: str,
                   snap_time: str, underlying: str) -> float:
-    """V_CoC 15-min velocity — CoC diff over a true 15-minute time window.
+    """V_CoC 15-min velocity -- CoC diff over a true 15-minute time window.
 
     Computes a Python-side HH:MM cutoff (snap_time minus 15 minutes) and
     filters the DB query by snap_time >= cutoff.  This guarantees the
@@ -123,7 +143,7 @@ def _compute_vcoc(conn: duckdb.DuckDBPyConnection, trade_date: str,
     silently extending the window to 20-25 min (the old LIMIT 4 flaw).
 
     Returns 0.0 if fewer than 2 snaps exist in the window (e.g. early
-    morning or very sparse data) — same safe default as before.
+    morning or very sparse data) -- same safe default as before.
     """
     try:
         h, m       = map(int, snap_time.split(":"))
@@ -150,7 +170,7 @@ def _compute_vcoc_from_series(rows: list, i: int) -> float:
 
     Uses index-3 (3 rows back = 15 min at 5-min cadence) for performance;
     feed-gap risk does not apply here because the series is fetched in one
-    query over the complete day — any gap in the source data produces a
+    query over the complete day -- any gap in the source data produces a
     gap entry in `rows` itself, which the caller can filter if needed.
     """
     if i < 3:
