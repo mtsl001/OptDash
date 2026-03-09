@@ -36,12 +36,12 @@ def run_pre_flight(
             f"option loses too much per day relative to price"
         )
 
-    # Rule 4: Max Pain proximity
-    # F7: use explicit None check instead of `or 1.0` falsy guard.
-    # max_pain_distance_pct=0.0 means spot is exactly on max pain (most
-    # dangerous stop-hunt zone). The old `or 1.0` coerced 0.0 to 1.0,
-    # disabling the proximity block in the exact scenario it must fire.
-    # Default 99.0 (safely far) only when the key is genuinely absent.
+    # Rule 4: Max Pain proximity — P4-F7: explicit None check so 0.0 (spot
+    # exactly on max pain — the most magnetically dangerous location) is NOT
+    # coerced to 1.0 by the falsy `or` operator, which previously silenced the
+    # proximity block entirely when spot == max pain.
+    # Absent distance defaults to 99.0 (safely far) so the guard only fires
+    # on real proximity data, not on missing data.
     raw_dist      = gex_data.get("max_pain_distance_pct")
     max_pain_dist = raw_dist if raw_dist is not None else 99.0
     if abs(max_pain_dist) < settings.PREFLIGHT_MAX_PAIN_PROXIMITY * 100:
@@ -56,22 +56,20 @@ def run_pre_flight(
             f"S_score {strike.get('s_score', 0):.1f} below floor {settings.PREFLIGHT_MIN_SSCORE}"
         )
 
-    # Rule 6: No concurrent trades (per underlying)
-    # F3 (recommender): message now names the specific underlying so the
-    # pre-flight log is unambiguous when multiple underlyings are tracked.
+    # Rule 6: No concurrent trades for this underlying — P4-F3: updated message
+    # to reflect per-underlying policy (not global one-at-a-time).
     if existing_open_trades > 0:
-        underlying = strike.get("underlying", "this underlying")
         failures.append(
-            f"{existing_open_trades} trade(s) already open for {underlying} — "
-            f"one position per underlying allowed"
+            f"{existing_open_trades} trade(s) already open — one position per underlying allowed"
         )
 
-    # Rule 7: DTE<=1 elevated requirements
-    # F6: changed from strict `dte == 1` to `(dte or 99) <= 1`.
-    # DTE=0 (expiry morning, 09:15-14:00) is even higher risk than DTE=1
-    # (day before expiry) but was silently skipped by the old equality check.
+    # Rule 7: DTE≤1 elevated requirements — P4-F6: covers DTE=0 (expiry morning,
+    # 09:15–14:00) as well as DTE=1 (day before expiry). The old strict `== 1`
+    # check left DTE=0 completely unguarded — the highest-risk expiry window.
+    # Guarded with explicit None check: if screener omits DTE, we skip the rule
+    # rather than blocking every trade on missing data.
     dte = strike.get("dte")
-    if (dte if dte is not None else 99) <= 1:
+    if dte is not None and dte <= 1:
         if gate_score < settings.PREFLIGHT_DTE1_MIN_GATE:
             failures.append(
                 f"DTE≤1 requires gate >= {settings.PREFLIGHT_DTE1_MIN_GATE}, got {gate_score}"
