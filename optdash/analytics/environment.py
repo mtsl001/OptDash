@@ -144,10 +144,17 @@ def get_environment_score(
         # intentional -- the VEX bonus must be earned against a known trade
         # type. Removing the old 'direction is None' fallback prevents
         # inflated gate scores from API callers that omit direction.
-        c9_met = False
-        if direction == "CE" and vex_total > 0:
+        #
+        # Fix ENV-1: apply the same per-underlying VEX threshold used by
+        # _classify_vex() in vex_cex.py and direction.py Signal 3.
+        # The previous bare `vex_total > 0` check let any non-zero VEX earn
+        # 2 gate points regardless of whether it crossed the meaningful
+        # threshold, creating an incoherent gate/direction scoring pair.
+        c9_met  = False
+        vex_thr = settings.VEX_THRESHOLDS.get(underlying, settings.VEX_BULL_THRESHOLD)
+        if direction == "CE" and vex_total > vex_thr:
             c9_met = True
-        elif direction == "PE" and vex_total < 0:
+        elif direction == "PE" and vex_total < -vex_thr:
             c9_met = True
         conditions["vex_aligned"] = {
             "met": c9_met, "value": round(vex_total, 2),
