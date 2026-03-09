@@ -69,6 +69,14 @@ def _is_market_hours() -> bool:
     now = _now_ist()
     if now.weekday() >= 5:          # Sat / Sun
         return False
+    # F10: check NSE market holidays so scheduler skips all 468 ticks per
+    # holiday day rather than running analytics that return empty data.
+    # getattr with [] default: startup never fails if MARKET_HOLIDAYS is not
+    # yet declared in config.py. Populate with YYYY-MM-DD strings:
+    #   MARKET_HOLIDAYS=["2026-03-14","2026-04-18"] in .env or config.py.
+    holidays = getattr(settings, "MARKET_HOLIDAYS", [])
+    if _today_str() in set(holidays):
+        return False
     t = now.hour * 60 + now.minute
     return (9 * 60 + 15) <= t <= (15 * 60 + 30)
 
@@ -109,7 +117,15 @@ def _build_gate_cache(
     for t in open_trades:
         underlying = t["underlying"]
         if underlying in cache:
-            continue  # only compute once per underlying
+            # F9: design invariant -- pre-flight Rule 6 in the recommender
+            # guarantees at most one ACCEPTED trade per underlying at any
+            # time, so the first match is always the only match. The cache
+            # key is `underlying` (not `(underlying, option_type)`) by
+            # design. IMPORTANT: if multi-leg support is added in future,
+            # the key MUST be changed to (underlying, option_type) and all
+            # callers updated, otherwise gate scores for the second leg
+            # will silently use the first leg's direction.
+            continue
         try:
             cache[underlying] = get_environment_score(
                 duck, trade_date, snap_time,
@@ -187,7 +203,16 @@ def create_scheduler(
                     del done_flags[oldest]
 
                 done_flags[trade_date] = True
-                return  # skip normal tick on EOD
+                return  # skip normal tick on the EOD sweep tick itself
+
+            # F8: block all normal-tick work on any tick AFTER EOD has already
+            # been processed today. Without this, the 15:30 tick (the last tick
+            # that _is_market_hours() passes) falls through to Steps 1-5,
+            # including generate_recommendation(). That issues a post-market
+            # trade card that persists overnight as a stale GENERATED
+            # recommendation until expire_stale_recommendations fires next morning.
+            if _eod_done_today(done_flags):
+                return
 
             # -- Step 1: Expire stale pending recommendations ------------------
             expire_stale_recommendations(jconn, trade_date, snap_time)
