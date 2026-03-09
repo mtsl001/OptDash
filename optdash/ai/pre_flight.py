@@ -81,7 +81,13 @@ def run_pre_flight(
             )
 
     # Rule 8: Dealer O'Clock hard block on DTE<=1
-    if dealer_oclock and (strike.get("dte") or 99) <= 1:
+    # Fix PF-1: explicit None guard so DTE=0 (expiry morning, highest-risk window)
+    # is correctly blocked. The previous `or 99` coercion treated 0 as falsy and
+    # substituted 99, making the rule permanently skip on expiry morning even
+    # though DTE=0 is exactly the condition it was designed to catch.
+    # Absent DTE (None) still defaults to 99 — rule skips on missing data as intended.
+    _r8_dte = strike.get("dte")
+    if dealer_oclock and (_r8_dte if _r8_dte is not None else 99) <= 1:
         failures.append(
             "DEALER O'CLOCK on expiry day — charm distortion blocks entry"
         )
