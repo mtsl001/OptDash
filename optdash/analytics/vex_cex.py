@@ -112,7 +112,7 @@ def _get_by_strike(conn, trade_date, snap_time, underlying) -> list[dict]:
     try:
         rows = conn.execute("""
             SELECT strike_price, option_type,
-                   (strike_price - AVG(spot) OVER()) / AVG(spot) OVER() * 100 AS moneyness_pct,
+                   (strike_price - AVG(spot) OVER()) / NULLIF(AVG(spot) OVER(), 0) * 100 AS moneyness_pct,
                    SUM(vex)/1e6 AS vex_M, SUM(cex)/1e6 AS cex_M,
                    SUM(oi) AS oi, AVG(iv) AS iv, MIN(dte) AS dte
             FROM options_data
@@ -121,7 +121,13 @@ def _get_by_strike(conn, trade_date, snap_time, underlying) -> list[dict]:
         """, [trade_date, snap_time, underlying]).fetchall()
         return [{
             "strike_price": r[0], "option_type": r[1],
-            "moneyness_pct": round(r[2] or 0, 2),
+            # Fix VEX-2: return None for missing/zero spot rows instead of
+            # coercing NULL moneyness to 0.0 via `or 0`, which misclassifies
+            # every strike as exactly at-the-money when AVG(spot) is absent.
+            # NULLIF in the SQL prevents DivisionByZero; None here lets the
+            # frontend display "N/A" correctly rather than rendering a phantom
+            # 0% moneyness band across all strikes.
+            "moneyness_pct": round(r[2], 2) if r[2] is not None else None,
             "vex_M": round(r[3] or 0, 2), "cex_M": round(r[4] or 0, 2),
             "oi": r[5], "iv": round(r[6] or 0, 2), "dte": r[7],
         } for r in rows]
