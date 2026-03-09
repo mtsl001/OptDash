@@ -64,9 +64,17 @@ def _today_str() -> str:
 
 
 def _snap_time_str() -> str:
-    """Round down to nearest 5-min snap (HH:MM)."""
-    now  = _now_ist()
-    mins = (now.minute // 5) * 5
+    """Round down to nearest scheduler-interval snap (HH:MM).
+
+    Fix S-3: interval_mins derived from SCHEDULER_INTERVAL_SECONDS so
+    the snap key produced here always matches the keys written by the BQ
+    feed pipeline and read by DuckDB queries. Hardcoded // 5 produced
+    wrong snap keys at any non-5-minute interval (e.g. 10-min ticks),
+    causing every analytics call to return empty data silently.
+    """
+    now           = _now_ist()
+    interval_mins = max(1, settings.SCHEDULER_INTERVAL_SECONDS // 60)
+    mins          = (now.minute // interval_mins) * interval_mins
     return f"{now.hour:02d}:{mins:02d}"
 
 
