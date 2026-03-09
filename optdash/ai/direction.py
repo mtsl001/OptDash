@@ -1,4 +1,4 @@
-"""Directional bias engine — weighted signal voting.
+"""Directional bias engine -- weighted signal voting.
 
 Signal weights:
   V_CoC velocity spike  -> weight 3  (strongest: order-flow momentum)
@@ -8,7 +8,7 @@ Signal weights:
   PCR divergence        -> weight 1  (retail sentiment contra-indicator)
 
 Max CE/PE weight = 9 (all signals same direction).
-Ties (ce_weight == pe_weight) yield NEUTRAL — no edge when signals cancel.
+Ties (ce_weight == pe_weight) yield NEUTRAL -- no edge when signals cancel.
 
 Fix-G: get_directional_bias() now includes 'vex_data' in its return dict
 so callers (recommender.py) can read the already-computed VEX snapshot
@@ -38,7 +38,7 @@ def get_directional_bias(
 
         signals: list[dict] = []
 
-        # ── Signal 1: V_CoC velocity (weight 3) ─────────────────────────────
+        # ── Signal 1: V_CoC velocity (weight 3) ───────────────────────────────────────────
         vcoc        = coc.get("v_coc_15m") or 0
         vcoc_active = _is_vcoc_spike_active(conn, trade_date, snap_time, underlying)
         if vcoc > settings.VCOC_BULL_THRESHOLD or (vcoc_active and vcoc > 0):
@@ -48,8 +48,8 @@ def get_directional_bias(
             signals.append({"signal": "VCOC_BEAR", "weight": 3,
                              "direction": Direction.PE.value, "value": vcoc})
 
-        # ── Signal 2: Futures OBI (weight 2) ────────────────────────────
-        # FUT_OBI_BEAR_THRESHOLD is a per-underlying dict — resolve before comparison.
+        # ── Signal 2: Futures OBI (weight 2) ───────────────────────────────────────
+        # FUT_OBI_BEAR_THRESHOLD is a per-underlying dict -- resolve before comparison.
         fut_obi_thr = settings.FUT_OBI_BEAR_THRESHOLD.get(underlying, -0.20)
         if fobi < fut_obi_thr:
             signals.append({"signal": "FUT_OBI_BEAR", "weight": 2,
@@ -58,7 +58,7 @@ def get_directional_bias(
             signals.append({"signal": "FUT_OBI_BULL", "weight": 2,
                              "direction": Direction.CE.value, "value": fobi})
 
-        # ── Signal 3: VEX alignment (weight 2) ──────────────────────────
+        # ── Signal 3: VEX alignment (weight 2) ──────────────────────────────────────
         # Fix-E: use per-underlying threshold (same dict as _classify_vex)
         # instead of bare > 0 / < 0. This prevents weight-2 ghost votes when
         # VEX noise oscillates around zero on low-liquidity underlyings.
@@ -71,7 +71,7 @@ def get_directional_bias(
             signals.append({"signal": "VEX_BEAR", "weight": 2,
                              "direction": Direction.PE.value, "value": vex_total})
 
-        # ── Signal 4: ATM OBI (weight 1) ──────────────────────────────
+        # ── Signal 4: ATM OBI (weight 1) ────────────────────────────────────────────
         if obi > settings.OBI_THRESHOLD:
             signals.append({"signal": "OBI_BULL", "weight": 1,
                              "direction": Direction.CE.value, "value": obi})
@@ -79,7 +79,7 @@ def get_directional_bias(
             signals.append({"signal": "OBI_BEAR", "weight": 1,
                              "direction": Direction.PE.value, "value": obi})
 
-        # ── Signal 5: PCR divergence (weight 1) ─────────────────────────
+        # ── Signal 5: PCR divergence (weight 1) ───────────────────────────────────────
         div = pcr.get("pcr_divergence", 0)
         if div > settings.PCR_DIV_BULL_THRESHOLD:
             signals.append({"signal": "PCR_RETAIL_PUTS", "weight": 1,
@@ -97,7 +97,7 @@ def get_directional_bias(
                     "pe_weight": 0, "margin": 0, "signals": [],
                     "vex_data": vex}
 
-        # Tie — contradictory signals cancel, no tradeable edge
+        # Tie -- contradictory signals cancel, no tradeable edge
         if ce_weight == pe_weight:
             return {
                 "direction": Direction.NEUTRAL.value,
@@ -121,9 +121,16 @@ def get_directional_bias(
         }
 
     except Exception as e:
-        logger.warning("get_directional_bias error: {}", e)
-        # vex may not be bound if exception occurred early — do not include vex_data
-        # here. recommender.py falls back to a fresh fetch via the 'or' pattern.
+        # logger.exception appends full traceback automatically (Loguru).
+        # underlying/trade_date/snap_time in the message make every silent
+        # NEUTRAL in production logs attributable to a specific instrument
+        # and time window.
+        # vex may not be bound if exception occurred before get_vex_cex_current();
+        # recommender.py falls back to a fresh fetch via the key-presence check.
+        logger.exception(
+            "get_directional_bias failed for {}/{}/{}: {}",
+            underlying, trade_date, snap_time, e,
+        )
         return {"direction": Direction.NEUTRAL.value, "ce_weight": 0,
                 "pe_weight": 0, "margin": 0, "signals": []}
 
