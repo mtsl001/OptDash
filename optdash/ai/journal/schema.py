@@ -13,9 +13,13 @@ CREATE_TRADES = """
 CREATE TABLE IF NOT EXISTS trades (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     trade_date          TEXT    NOT NULL,
+    -- snap_time = AI generation snap; immutable after INSERT.
+    -- Do NOT overwrite on ACCEPT -- use accept_snap_time for that.
     snap_time           TEXT    NOT NULL,
     underlying          TEXT    NOT NULL,
-    option_type         TEXT    NOT NULL,   -- CE | PE
+    -- Fix-P1-12: CHECK constraint rejects any value outside CE/PE.
+    -- Prevents Direction.NEUTRAL or a typo from being stored silently.
+    option_type         TEXT    NOT NULL CHECK(option_type IN ('CE','PE')),
     strike_price        REAL    NOT NULL,
     expiry_date         TEXT    NOT NULL,
     dte                 INTEGER,
@@ -30,12 +34,16 @@ CREATE TABLE IF NOT EXISTS trades (
     final_pnl_pct       REAL,
     confidence          INTEGER NOT NULL,
     gate_score          INTEGER NOT NULL,
-    gate_verdict        TEXT    NOT NULL,
+    -- Fix-P1-12: CHECK constraints on gate_verdict and status.
+    gate_verdict        TEXT    NOT NULL
+                        CHECK(gate_verdict IN ('GO','WAIT','NO_GO')),
     s_score             REAL,
     quality_grade       TEXT,
     direction_signals   TEXT,               -- JSON blob
     narrative           TEXT,
-    status              TEXT    NOT NULL DEFAULT 'GENERATED',
+    -- Fix-P1-12: status CHECK ensures only valid TradeStatus values are stored.
+    status              TEXT    NOT NULL DEFAULT 'GENERATED'
+                        CHECK(status IN ('GENERATED','ACCEPTED','REJECTED','EXPIRED','CLOSED')),
     rejection_reason    TEXT,
     rejection_note      TEXT,
     session             TEXT,               -- MarketSession enum value
@@ -46,6 +54,10 @@ CREATE TABLE IF NOT EXISTS trades (
     iv_at_entry         REAL,
     spot_at_entry       REAL,
     conf_buckets        TEXT,               -- JSON blob
+    -- Fix-P1-14: acceptance snap stored separately so snap_time (generation
+    -- time) is never overwritten. The generation-to-acceptance delta is a
+    -- key learning signal preserved by this separation.
+    accept_snap_time    TEXT,               -- set on ACCEPT; snap_time stays immutable
     created_at          TEXT    DEFAULT (datetime('now')),
     updated_at          TEXT    DEFAULT (datetime('now'))
 );
@@ -155,6 +167,10 @@ _MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN iv_at_entry        REAL",
     "ALTER TABLE trades ADD COLUMN spot_at_entry      REAL",
     "ALTER TABLE trades ADD COLUMN conf_buckets       TEXT",
+
+    # Fix-P1-14: accept_snap_time stores the acceptance snap; snap_time now
+    # remains the immutable AI generation time for the lifetime of the row.
+    "ALTER TABLE trades ADD COLUMN accept_snap_time   TEXT",
 ]
 
 
