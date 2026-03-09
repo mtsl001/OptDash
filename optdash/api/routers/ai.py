@@ -18,7 +18,6 @@ router = APIRouter()
 
 # HH:MM 24-hour clock -- validated at API boundary so downstream snap-time
 # arithmetic never receives a malformed string.
-# Examples: '09:15', '15:25'  Valid range: 00:00 - 23:59
 SnapTime = Annotated[
     str,
     StringConstraints(
@@ -35,9 +34,6 @@ class AcceptRequest(BaseModel):
     snap_time:          SnapTime
     actual_entry_price: float | None = None
 
-    # F5: reject a zero or negative entry price at the API boundary.
-    # A zero entry would cause pnl_pct = (exit - 0) / 0 -> ZeroDivisionError
-    # in /close-trade; a negative entry inverts PnL sign silently.
     @field_validator("actual_entry_price")
     @classmethod
     def _positive_price(cls, v: float | None) -> float | None:
@@ -59,9 +55,6 @@ class CloseRequest(BaseModel):
 
 
 # -- Learning report TTL cache ------------------------------------------------
-# F6: build_learning_report() runs 8+ SQL aggregations per call. Cache results
-# for REPORT_TTL seconds to avoid recomputing on every dashboard poll or fast
-# refresh. Keyed by `days` so different lookback windows cache independently.
 _report_cache: dict[int, dict] = {}
 _REPORT_TTL   = 60   # seconds
 
@@ -69,19 +62,7 @@ _REPORT_TTL   = 60   # seconds
 # -- Response helpers ---------------------------------------------------------
 
 def _hydrate_trade(trade: dict | None) -> dict | None:
-    """Deserialize JSON-string fields in a raw journal trade dict.
-
-    Fix-I: recommender.py stores conf_buckets and direction_signals via
-    json.dumps() so they land in SQLite as text columns. Without this
-    step, API consumers receive raw string literals instead of structured
-    objects, requiring client-side double-parsing.
-
-    Fields deserialized:
-      conf_buckets      (str -> dict)  fallback: {}
-      direction_signals (str -> list)  fallback: []
-
-    All other fields are passed through unchanged. None input returns None.
-    """
+    """Deserialize JSON-string fields in a raw journal trade dict."""
     if trade is None:
         return None
     result = dict(trade)
@@ -95,8 +76,6 @@ def _hydrate_trade(trade: dict | None) -> dict | None:
             try:
                 result[field] = json.loads(raw)
             except (ValueError, TypeError):
-                # Fix-O (F-07): log malformed JSON so journal corruption is
-                # detectable in logs rather than silently returning empty data.
                 logger.warning(
                     "_hydrate_trade: failed to parse '{}' for trade_id={} "
                     "-- raw value: {!r:.120} -- defaulting to {}",
@@ -119,7 +98,7 @@ def latest_recommendation(
     pending = trades.get_pending_trades(jconn, underlying=underlying)
     if not pending:
         return {"status": "NO_RECOMMENDATION"}
-    return _hydrate_trade(pending[0])   # index 0 = most-recent (ORDER BY created_at DESC)
+    return _hydrate_trade(pending[0])
 
 
 @router.get("/position/live")
@@ -138,7 +117,6 @@ def position_snaps(
     trade_id: int,
     jconn: sqlite3.Connection = Depends(get_journal),
 ):
-    """Full snap history: PnL, Greeks attribution, IV crush, theta SL series."""
     trade = trades.get_trade(jconn, trade_id)
     if not trade:
         raise HTTPException(404, "Trade not found")
@@ -162,13 +140,6 @@ def accept(
         raise HTTPException(
             400, f"Cannot accept trade in status '{trade['status']}'"
         )
-
-    # Fix-J (F-03): Removed shadow.create_shadow() from the accept path.
-    # Shadows are ONLY for rejected/expired trades (what-if tracking).
-    # Creating a shadow on accept was corrupting the learning engine:
-    # when the shadow hit its mechanical target it was classified as
-    # CLEAN_MISS (costly rejection), inverting the learning signal for
-    # trades that were actually taken and won.
     trades.accept_trade(jconn, req.trade_id, req.snap_time, req.actual_entry_price)
     return {"status": "accepted", "trade_id": req.trade_id}
 
@@ -181,9 +152,6 @@ def reject(
     trade = trades.get_trade(jconn, req.trade_id)
     if not trade:
         raise HTTPException(404, "Trade not found")
-
-    # Only GENERATED recommendations can be rejected.
-    # Live positions (ACCEPTED) must be closed via /close-trade.
     if trade["status"] != TradeStatus.GENERATED.value:
         raise HTTPException(
             400,
@@ -191,12 +159,10 @@ def reject(
             f"(current status='{trade['status']}'). "
             "Use /close-trade to exit a live position."
         )
-
-    # Fix-N proper (F-06): use commit=False on both DAOs so neither write
-    # commits independently.  Python's sqlite3 implicit transaction keeps
-    # both INSERTs in the same transaction until we call jconn.commit().
-    # On any failure jconn.rollback() undoes both writes atomically.
     try:
+        # Fix SHA-2: pass sl_price and target_price so shadow_tracker.py
+        # evaluates the hypothetical position using the parameters that were
+        # active when the recommendation was generated, not live config values.
         shadow.create_shadow(jconn, {
             "trade_id":      req.trade_id,
             "trade_date":    trade["trade_date"],
@@ -205,17 +171,18 @@ def reject(
             "strike_price":  trade["strike_price"],
             "expiry_date":   trade["expiry_date"],
             "entry_premium": trade["entry_premium"],
+            "sl_price":      trade["sl_price"],
+            "target_price":  trade["target_price"],
         }, commit=False)
         trades.reject_trade(
             jconn, req.trade_id, req.reason, req.note, commit=False
         )
-        jconn.commit()   # single atomic commit -- both writes land together
+        jconn.commit()
     except Exception as exc:
         jconn.rollback()
         raise HTTPException(
             500, f"Reject failed and was rolled back: {exc}"
         ) from exc
-
     return {"status": "rejected", "trade_id": req.trade_id}
 
 
@@ -233,12 +200,14 @@ def close_position(
 
     underlying = trade["underlying"]
 
-    # F5: guard against None / 0 entry price before any arithmetic.
-    # actual_entry_price is NULL when the trader accepted at the AI's
-    # entry_premium estimate; entry_premium should always be set but could
-    # be 0.0 in a corrupted row. Either case would produce ZeroDivisionError
-    # or a meaningless negative PnL -- surface it as a 400 instead.
-    entry = trade.get("actual_entry_price") or trade.get("entry_premium")
+    # Fix API-2: explicit None check so actual_entry_price=0.0 (data corruption)
+    # is not silently promoted to entry_premium via the `or` falsy coercion.
+    # entry_premium is always set at recommendation time and validated > 0 by
+    # the screener; actual_entry_price is set on ACCEPT and validated > 0 by
+    # AcceptRequest._positive_price.  A stored 0 means journal corruption --
+    # surface it as a 400 rather than recording a phantom pnl_pct of 0.
+    _actual = trade.get("actual_entry_price")
+    entry   = _actual if _actual is not None else trade.get("entry_premium")
     if not entry:
         raise HTTPException(
             400,
@@ -247,7 +216,6 @@ def close_position(
         )
 
     lot     = settings.LOT_SIZES.get(underlying, 1)
-    # Fix-K (F-01): pnl_abs is monetary (point_diff * lot); pnl_pct stays per-unit %
     pnl_abs = round((req.exit_price - entry) * lot, 2)
     pnl_pct = round((req.exit_price - entry) / entry * 100, 2)
 
@@ -273,8 +241,6 @@ def trade_history(
         jconn, page=page, per_page=per_page,
         underlying=underlying, status=status
     )
-    # Hydrate each trade row in the paginated result.
-    # get_trade_history returns a dict with a "trades" list key.
     if isinstance(result, dict) and "trades" in result:
         result["trades"] = [_hydrate_trade(t) for t in result["trades"]]
     elif isinstance(result, list):
@@ -287,10 +253,6 @@ def learning_report(
     days: int = Query(30, ge=7, le=365),
     jconn: sqlite3.Connection = Depends(get_journal),
 ):
-    # F6: return cached result if fresh enough.
-    # build_learning_report() runs 8+ SQL aggregations; recomputing on every
-    # poll is wasteful at 5000+ trades. 60s TTL is fine for a report used
-    # for intraday or next-day strategy review -- it is never time-critical.
     cached = _report_cache.get(days)
     if cached and (time.monotonic() - cached["ts"]) < _REPORT_TTL:
         return cached["data"]
