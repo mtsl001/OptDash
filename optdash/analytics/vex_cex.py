@@ -6,15 +6,12 @@ Classifier parameter change (Fix-B):
   thresholds from VEX_THRESHOLDS / CEX_CHARM_THRESHOLD / CEX_VANNA_THRESHOLD
   in config, instead of using global scalar constants for all indices.
 """
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import date
 
 import duckdb
 from loguru import logger
 from optdash.config import settings
 from optdash.models import VexSignal, CexSignal
-
-IST = ZoneInfo("Asia/Kolkata")
 
 
 def get_vex_cex_current(conn: duckdb.DuckDBPyConnection, trade_date: str,
@@ -40,7 +37,7 @@ def get_vex_cex_current(conn: duckdb.DuckDBPyConnection, trade_date: str,
         vex_total = row[2] or 0
         cex_total = row[5] or 0
         dte       = row[7] or 7
-        dealer_oc  = _is_dealer_oclock(snap_time, dte, underlying)
+        dealer_oc  = _is_dealer_oclock(snap_time, dte, underlying, trade_date)
         vex_signal = _classify_vex(vex_total, underlying)
         cex_signal = _classify_cex(cex_total, underlying)
         interp     = _interpret(vex_signal, cex_signal, dealer_oc)
@@ -91,7 +88,7 @@ def _get_vex_cex_series(conn, trade_date, underlying) -> list[dict]:
         result = []
         for r in rows:
             vex, cex, dte = r[1] or 0, r[4] or 0, r[8] or 7
-            dealer_oc  = _is_dealer_oclock(r[0], dte, underlying)
+            dealer_oc  = _is_dealer_oclock(r[0], dte, underlying, trade_date)
             # Pass underlying so per-underlying thresholds are applied
             # consistently across the series (not just the current snap).
             vex_sig = _classify_vex(vex, underlying)
@@ -181,15 +178,24 @@ def _classify_cex(cex_total: float, underlying: str = "") -> str:
     return CexSignal.NEUTRAL.value
 
 
-def _is_dealer_oclock(snap_time: str, dte: int, underlying: str) -> bool:
-    """True when DTE<=1, time >= DEALER_OCLOCK_START, AND today is the correct
+def _is_dealer_oclock(snap_time: str, dte: int, underlying: str, trade_date: str) -> bool:
+    """True when DTE<=1, snap_time >= DEALER_OCLOCK_START, AND today is the correct
     weekly expiry weekday for this underlying.
 
+    Fix VEX-1: use date.fromisoformat(trade_date) instead of datetime.now(IST).
+    The previous wall-clock weekday caused _is_dealer_oclock to return the wrong
+    result for any historical data review, backtest, or replay session run on a
+    different calendar day than the data being processed (e.g. reviewing last
+    Tuesday's FINNIFTY data on a Wednesday would incorrectly report no dealer
+    O'Clock activity, suppressing the correct charm-flow interpretation).
+
+    Removed IST / ZoneInfo dependency -- no longer needed after this fix.
+
     Rationale: each underlying has a different expiry day --
-      FINNIFTY  -> Tuesday   (weekday 1)
+      FINNIFTY   -> Tuesday   (weekday 1)
       MIDCPNIFTY -> Monday    (weekday 0)
       NIFTYNXT50 -> Friday    (weekday 4)
-      SENSEX    -> Friday    (weekday 4)
+      SENSEX     -> Friday    (weekday 4)
       NIFTY / BANKNIFTY -> Thursday (weekday 3)  [default]
 
     Applying a single Thursday-centric window to all underlyings causes
@@ -200,7 +206,7 @@ def _is_dealer_oclock(snap_time: str, dte: int, underlying: str) -> bool:
     if snap_time < settings.DEALER_OCLOCK_START:
         return False
     expected_weekday = settings.EXPIRY_WEEKDAY.get(underlying, 3)  # default Thursday
-    today_weekday    = datetime.now(IST).weekday()
+    today_weekday    = date.fromisoformat(trade_date).weekday()
     return today_weekday == expected_weekday
 
 
