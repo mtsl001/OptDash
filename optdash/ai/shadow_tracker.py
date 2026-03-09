@@ -37,25 +37,38 @@ def track_shadow_positions(
         hit_sl  = ltp <= s["entry_premium"] * (1 - settings.AI_SL_PCT)
         hit_tgt = ltp >= s["entry_premium"] * settings.AI_TARGET_MULT
 
-        shadow.insert_shadow_snap(jconn, {
-            "shadow_id":  s["id"],
-            "snap_time":  snap_time,
-            "ltp":        ltp,
-            "pnl_pct":    pnl,
-            "hit_sl":     int(hit_sl),
-            "hit_target": int(hit_tgt),
-        })
+        # F16: when this snap is the closing snap (SL or target hit), pass
+        # commit=False so the INSERT stays in the open implicit transaction.
+        # close_shadow() follows immediately and commits both writes together,
+        # making the snap row and the is_closed flag update atomic.
+        # A crash between insert and close previously left is_closed=0
+        # forever, causing duplicate snaps and double-close on every
+        # subsequent tick for that shadow.
+        is_closing = hit_sl or hit_tgt
+
+        shadow.insert_shadow_snap(
+            jconn,
+            {
+                "shadow_id":  s["id"],
+                "snap_time":  snap_time,
+                "ltp":        ltp,
+                "pnl_pct":    pnl,
+                "hit_sl":     int(hit_sl),
+                "hit_target": int(hit_tgt),
+            },
+            commit=not is_closing,   # False → snap stays uncommitted until close_shadow()
+        )
 
         # Close shadow if SL or target is hit intra-day.
         # EOD close is handled by finalize_all_shadows() in eod.py
         # (called by scheduler before this function runs).
-        if hit_sl or hit_tgt:
+        if is_closing:
             outcome = _classify_shadow_outcome(pnl)
             shadow.close_shadow(jconn, s["id"], {
                 "final_pnl_pct": pnl,
                 "outcome":       outcome,
                 "closed_snap":   snap_time,
-            })
+            })  # close_shadow() always commits — this is the single flush
             logger.debug(
                 "Shadow {} closed intra-day: outcome={} pnl={:+.1f}%",
                 s["id"], outcome, pnl
