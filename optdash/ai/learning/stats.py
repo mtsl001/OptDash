@@ -21,6 +21,15 @@ def get_session_stats(
     confidence.py) can detect when global stats were substituted and apply
     cold-start discounting rather than granting B4 credits based on thin
     or non-existent bucket history.
+
+    Fix LEARN-2: win_rate is None when total=0 (no closed trades at all).
+    The previous default of 50.0 silently granted int(0.50*12)=6 B4 points
+    on a fresh deployment before the cold-start guard in confidence.py
+    (total_trades < 5) could catch it, because the global fallback path
+    can return any total.  Returning None lets every caller apply its own
+    safe default rather than receiving a fabricated 50% track record.
+    confidence.py already handles None via the total_trades < 5 guard;
+    other callers should check for None before arithmetic.
     """
     base_where = ["status='CLOSED'", "final_pnl_pct IS NOT NULL"]
     params: list = []
@@ -35,6 +44,8 @@ def get_session_stats(
         base_where.append("session=?")
         params.append(session.value)
 
+    # IMPORTANT: ALL filter values must be added to `params` as bind parameters,
+    # NOT interpolated into base_where strings. Violation enables SQL injection.
     where = " AND ".join(base_where)
     row = conn.execute(
         f"""SELECT
@@ -49,11 +60,8 @@ def get_session_stats(
 
     total = row[0] or 0
     # P4-F15: capture fallback state before potentially overwriting `total`.
-    # was_fallback=True means the specific bucket (underlying+direction+session)
-    # had fewer than min_trades closed trades, so global stats were used.
     was_fallback = total < min_trades
     if was_fallback:
-        # Fallback: global stats — not enough history in this specific bucket
         row = conn.execute(
             """SELECT COUNT(*),
                       SUM(CASE WHEN final_pnl_pct > 0 THEN 1 ELSE 0 END),
@@ -67,7 +75,13 @@ def get_session_stats(
     avg_pnl  = round(float(row[2] or 0), 2)
     avg_conf = round(float(row[3] or 0), 1)
     avg_gate = round(float(row[4] or 0), 1)
-    win_rate = round((wins / total * 100) if total else 50.0, 1)
+
+    # Fix LEARN-2: return None when total=0 so callers receive an explicit
+    # "no data" signal instead of a fabricated 50.0% track record.
+    # The previous `else 50.0` default propagated into B4 as
+    # int(0.50 * 12) = 6 pts of fictitious historical performance credit
+    # before confidence.py's cold-start guard (total_trades < 5) could catch it.
+    win_rate = round(wins / total * 100, 1) if total else None
 
     return {
         "win_rate":       win_rate,
@@ -97,6 +111,14 @@ def get_threshold_performance(
 
     if buckets is None:
         buckets = [(0, 50), (50, 65), (65, 75), (75, 85), (85, 101)]
+
+    # Fix LEARN-3: validate bucket ordering so (lo >= hi) never produces
+    # a silent always-empty WHERE clause.
+    for lo, hi in buckets:
+        if lo >= hi:
+            raise ValueError(
+                f"Bucket ({lo}, {hi}) is invalid: lo must be < hi"
+            )
 
     results = []
     for lo, hi in buckets:
