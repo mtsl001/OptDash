@@ -1,4 +1,5 @@
-"""IV analytics — IVR, IVP, term structure, shape detection."""
+"""IV analytics -- IVR, IVP, term structure, shape detection."""
+from datetime import datetime, timedelta
 import duckdb
 from loguru import logger
 from optdash.config import settings
@@ -64,34 +65,59 @@ def get_ivr_ivp(
         )
 
         # IVP: percentile rank of current IV vs historical daily distribution.
-        # Single CTE scan instead of two identical subqueries.
+        # F11: add consistent lookback window (same IV_LOOKBACK_DAYS as IVR)
+        # and a minimum-sample guard: fewer than 20 trading days of history
+        # produces a meaningless rank -- return None so gate C5 falls back to
+        # the conservative "not cheap" posture (ivp_val = 100.0).
+        lookback_date = (
+            datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=settings.IV_LOOKBACK_DAYS)
+        ).strftime("%Y-%m-%d")
+
         pct_row = conn.execute("""
             WITH daily_ivs AS (
                 SELECT trade_date, AVG(iv) AS d
                 FROM options_data
                 WHERE underlying=? AND expiry_tier='TIER1'
                   AND trade_date < ?
+                  AND trade_date >= ?
                 GROUP BY trade_date
             )
             SELECT
                 SUM(CASE WHEN d <= ? THEN 1 ELSE 0 END) AS below,
                 COUNT(*) AS total
             FROM daily_ivs
-        """, [underlying, trade_date, atm_iv]).fetchone()
+        """, [underlying, trade_date, lookback_date, atm_iv]).fetchone()
 
-        total = pct_row[1] if pct_row and pct_row[1] else 1
-        ivp   = round(pct_row[0] / total * 100, 1) if total else 50.0
+        below = int(pct_row[0] or 0) if pct_row else 0
+        total = int(pct_row[1] or 0) if pct_row else 0
+        if total < 20:
+            # Insufficient history -- return None; gate C5 treats this as
+            # "IV not cheap" (ivp_val = 100.0) via the None guard in environment.py.
+            ivp = None
+        else:
+            ivp = round(below / total * 100, 1)
 
-        # HV20 — 20-day realised volatility
+        # HV20 -- 20-day realised volatility
+        # F10: triple-nested query so LAG() window runs over the full ordered
+        # history first; only then does the outer LIMIT 22 select the 22 most-
+        # recent daily returns. The prior single-subquery form applied LIMIT
+        # before LAG, making lag-pairs from a DESC-ordered cut-off set.
         hv20_row = conn.execute("""
             SELECT STDDEV(daily_ret) * SQRT(252) * 100 AS hv20
             FROM (
-                SELECT trade_date,
-                       LN(MAX(spot) / LAG(MAX(spot)) OVER (ORDER BY trade_date)) AS daily_ret
-                FROM options_data
-                WHERE underlying=? AND trade_date <= ?
-                GROUP BY trade_date
-                ORDER BY trade_date DESC
+                SELECT daily_ret
+                FROM (
+                    SELECT
+                        trade_date,
+                        LN(
+                            MAX(spot) /
+                            LAG(MAX(spot)) OVER (ORDER BY trade_date)
+                        ) AS daily_ret
+                    FROM options_data
+                    WHERE underlying=? AND trade_date <= ?
+                    GROUP BY trade_date
+                    ORDER BY trade_date DESC
+                ) all_rets
                 LIMIT 22
             )
         """, [underlying, trade_date]).fetchone()
