@@ -54,24 +54,20 @@ def generate_recommendation(
     direction = dir_res["direction"]
     session   = get_market_session(snap_time)
 
-    # ── Step 2: Gate — direction-aware so C9 (VEX, 2 pts) scores correctly ───
-    # Passing direction= ensures C9 awards points only when VEX aligns with the
-    # actual CE/PE trade direction, not whenever VEX is non-zero.
+    # ── Step 2: Gate — direction-aware so C9 (VEX, 2 pts) scores correctly ─────
     gate = get_environment_score(conn, trade_date, snap_time, underlying, direction=direction)
 
-    # ── Step 3: Supporting analytics ─────────────────────────────────────────────
+    # ── Step 3: Supporting analytics ────────────────────────────────────────────────
     iv_data  = get_ivr_ivp(conn, trade_date, snap_time, underlying)
     gex_data = get_net_gex(conn, trade_date, snap_time, underlying)
-    # Fix-G / F2: get_directional_bias() already computed get_vex_cex_current()
-    # internally and exposes the result as dir_res["vex_data"]. Read it directly
-    # to avoid a second identical DuckDB round-trip.
-    # F2 fix: use key-presence check (`"vex_data" in dir_res`) instead of
-    # truthiness (`dir_res.get("vex_data") or ...`). An empty dict `{}` is a
-    # valid result on quiet markets and is falsy, which incorrectly triggered
-    # the fallback get_vex_cex_current() call, defeating the optimisation.
+
+    # P4-F2: Fix-G already avoids a second get_vex_cex_current() round-trip by
+    # reading dir_res["vex_data"] directly. The previous `or` pattern fired the
+    # second call whenever vex_data was an empty dict {} (falsy but valid).
+    # Key-presence check ensures {} is accepted as-is; second call only fires
+    # when direction.py hit an exception before computing vex (key absent).
     vex_data = (
-        dir_res["vex_data"]
-        if "vex_data" in dir_res
+        dir_res["vex_data"] if "vex_data" in dir_res
         else get_vex_cex_current(conn, trade_date, snap_time, underlying)
     )
 
@@ -106,7 +102,7 @@ def generate_recommendation(
         jconn, underlying=underlying, direction=direction, session=session
     )
 
-    # ── Confidence score ────────────────────────────────────────────────────
+    # ── Confidence score ─────────────────────────────────────────────────────
     conf_result = compute_confidence(
         gate_score=gate["score"],
         direction_result=dir_res,
@@ -119,11 +115,11 @@ def generate_recommendation(
     )
     confidence = conf_result["confidence"]
 
-    # ── Pre-flight hard rules ───────────────────────────────────────────────
+    # ── Pre-flight hard rules ──────────────────────────────────────────────────
     passed, failures = run_pre_flight(
         gate_score=gate["score"],
         confidence=confidence,
-        strike={**strike, "underlying": underlying},
+        strike=strike,
         gex_data={**gex_data, "max_pain_distance_pct": max_pain.get("distance_pct", 99)},
         session=session,
         existing_open_trades=len(open_trades),
@@ -135,14 +131,14 @@ def generate_recommendation(
         )
         return None
 
-    # ── SL / Target ────────────────────────────────────────────────────────
+    # ── SL / Target ─────────────────────────────────────────────────────────
     sl     = round(entry_premium * (1 - settings.AI_SL_PCT), 2)
     target = round(entry_premium * settings.AI_TARGET_MULT, 2)
 
-    # ── Quality grade ──────────────────────────────────────────────────────
+    # ── Quality grade ───────────────────────────────────────────────────────
     quality = compute_quality_score(strike, gate["score"], confidence)
 
-    # ── Narrative ───────────────────────────────────────────────────────────
+    # ── Narrative ────────────────────────────────────────────────────────────
     narrative = build_narrative(
         direction=direction,
         gate_score=gate["score"],
@@ -155,7 +151,7 @@ def generate_recommendation(
         dealer_oclock=dealer_oc,
     )
 
-    # ── Write to journal ─────────────────────────────────────────────────────────
+    # ── Write to journal ───────────────────────────────────────────────────────────
     trade_id = trades.create_trade(jconn, {
         "trade_date":        trade_date,
         "snap_time":         snap_time,
@@ -199,16 +195,12 @@ def _nearest_expiry(
     snap_time:  str,
     underlying: str,
 ) -> str | None:
-    """Return the nearest TIER1 expiry date on or after trade_date.
+    """Return the nearest TIER1 expiry that has not yet passed.
 
-    F1: added AND expiry_tier='TIER1' and expiry_date >= ? (bind param).
-    Without the tier filter, MIN(expiry_date) could return a just-rolled
-    TIER2/TIER3 contract on Friday morning post-rollover, polluting
-    get_max_pain() with stale OI data and producing a wrong max_pain_dist
-    value in the pre-flight proximity check (Rule 4).
-    Using a bind param for the date floor avoids DuckDB column-scoping
-    ambiguity that the previous `expiry_date >= trade_date` column reference
-    could cause when trade_date also appears as a WHERE filter.
+    P4-F1: added AND expiry_tier='TIER1' so post-rollover Friday morning
+    MIN(expiry_date) cannot return the just-expired weekly contract.
+    Changed expiry_date >= trade_date column-self-ref to a parameterised
+    bind so the intent is explicit and safe against schema renames.
     """
     try:
         row = conn.execute("""
