@@ -32,8 +32,25 @@ def purge_old_raw_parquets(data_root: Path, retention_days: int) -> None:
         for parquet_file in raw_dir.glob("*.parquet"):
             try:
                 file_date = date.fromisoformat(parquet_file.stem)  # YYYY-MM-DD
-                if file_date < cutoff:
-                    parquet_file.unlink()
-                    logger.info("[Purge] Deleted stale raw Parquet: {}", parquet_file)
             except ValueError:
-                pass  # Non-date filename — skip silently
+                continue  # Non-date filename — skip silently
+
+            if file_date >= cutoff:
+                continue
+
+            try:
+                parquet_file.unlink()
+                logger.info("[Purge] Deleted stale raw Parquet: {}", parquet_file)
+            except PermissionError:
+                # Windows: file still open by another process (e.g. DuckDB fd).
+                # Log and skip — the file will be retried on the next daily sweep.
+                logger.warning(
+                    "[Purge] Could not delete file (in use, will retry next sweep): {}",
+                    parquet_file,
+                )
+            except OSError as e:
+                # Unexpected filesystem error (e.g. read-only fs, NFS stale handle).
+                # Log but continue — one bad file should not abort the whole sweep.
+                logger.error(
+                    "[Purge] Unexpected error deleting {}: {}", parquet_file, e
+                )
