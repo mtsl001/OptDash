@@ -64,22 +64,25 @@ def track_open_positions(
             "IN_TRADE"
         )
 
-        # Trailing stop
-        # F8: guard get_peak_ltp() returning None on the first tick for a trade
-        # (no position_snaps rows exist yet). The old code executed
-        # `max(None * 0.90, sl_adjusted)` which raises TypeError and silently
-        # kills the entire scheduler tick for every open position.
-        # Also track trailing_active + peak_ltp so the exit path can emit the
-        # correct ExitReason.TRAILING_STOP_HIT instead of using SL_HIT as proxy.
-        trailing_active = pnl_pct >= settings.TRAILING_STOP_ACTIVATION * 100
-        peak_ltp = None
-        if trailing_active:
+        # Trailing stop — P4-F8: guard peak_ltp against None.
+        # snaps.get_peak_ltp() returns None on the first scheduler tick after
+        # ACCEPT (no position_snaps rows exist yet). The previous code called
+        # `peak_ltp * 0.90` unconditionally, raising TypeError and killing the
+        # entire tick silently for every open trade.
+        #
+        # trailing_active is True only when the dynamic trail (peak * 0.90)
+        # actually exceeds the theta SL, i.e. when the trailing rail — not the
+        # base theta SL — is the governing stop level. This lets the exit block
+        # emit the correct ExitReason (TRAILING_STOP_HIT vs SL_HIT).
+        trailing_active = False
+        if pnl_pct >= settings.TRAILING_STOP_ACTIVATION * 100:
             peak_ltp = snaps.get_peak_ltp(jconn, trade["id"])
-            trail_sl = (
-                max(peak_ltp * 0.90, sl_adjusted)
-                if peak_ltp is not None
-                else sl_adjusted  # no snaps yet -- fall back to theta SL
-            )
+            if peak_ltp is not None:
+                dynamic_trail   = peak_ltp * 0.90
+                trail_sl        = max(dynamic_trail, sl_adjusted)
+                trailing_active = dynamic_trail > sl_adjusted
+            else:
+                trail_sl = sl_adjusted
         else:
             trail_sl = sl_adjusted
 
@@ -148,18 +151,17 @@ def track_open_positions(
         })
 
         # Auto-close logic
-        # F8: emit TRAILING_STOP_HIT when the trail fires (trailing_active and
-        # ltp dropped below peak * 0.90). Previously SL_HIT was used as a proxy,
-        # conflating two distinct exit types and corrupting per-exit-reason
-        # learning analysis (e.g. pure SL_HIT rate vs trailing stop rate).
         exit_reason = None
         if ltp <= trail_sl:
-            if theta_sl_status == "STOP_HIT":
-                exit_reason = ExitReason.THETA_SL_HIT.value
-            elif trailing_active and peak_ltp is not None and ltp < peak_ltp * 0.90:
-                exit_reason = ExitReason.TRAILING_STOP_HIT.value
-            else:
-                exit_reason = ExitReason.SL_HIT.value
+            # P4-F8: emit the correct exit reason based on which stop governed.
+            # THETA_SL_HIT  — option decayed past the theta-adjusted SL.
+            # TRAILING_STOP_HIT — trailing rail (peak*0.90) was the active stop.
+            # SL_HIT        — plain fixed SL hit before any trailing activation.
+            exit_reason = (
+                ExitReason.THETA_SL_HIT.value      if theta_sl_status == "STOP_HIT"
+                else ExitReason.TRAILING_STOP_HIT.value if trailing_active
+                else ExitReason.SL_HIT.value
+            )
         elif ltp >= trade["target_price"]:
             exit_reason = ExitReason.TARGET_HIT.value
         elif gate_no_go and _consecutive_no_go_count(
@@ -246,9 +248,6 @@ def _snaps_since(entry_snap: str, current_snap: str) -> int:
 
 
 def _consecutive_no_go_count(jconn: sqlite3.Connection, trade_id: int) -> int:
-    # F9: LIMIT 10 is hardcoded here. The startup assertion in deps.py
-    # (added in C7) ensures GATE_SUSTAINED_NO_GO_SNAPS <= 10, so this
-    # count is always sufficient to detect a sustained NO_GO run.
     try:
         rows = jconn.execute("""
             SELECT gate_verdict FROM position_snaps
