@@ -67,6 +67,15 @@ class Settings(BaseSettings):
             raise ValueError(f"Expected HH:MM format (e.g. '09:15'), got {v!r}")
         return v
 
+    # NSE market holidays — scheduler skips all ticks on these dates so no
+    # DuckDB scans or empty-data log noise accumulate on non-trading days.
+    # Format: YYYY-MM-DD strings. Default is empty (no holidays configured).
+    # Set in .env as a JSON array (pydantic-settings parses it automatically):
+    #   MARKET_HOLIDAYS=["2026-03-14","2026-04-14","2026-04-18"]
+    # The scheduler reads this via settings.MARKET_HOLIDAYS; a missing / empty
+    # list simply disables the holiday skip without any error.
+    MARKET_HOLIDAYS: list[str] = []
+
     # -- Per-Underlying Market Metadata
     # Fix-P1-6: inner-type annotations added to all per-underlying dicts so
     # pydantic validates element types when .env overrides supply JSON.
