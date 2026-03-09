@@ -22,6 +22,11 @@ dependencies = [
     "apscheduler>=3.10.4,<4.0",
     "loguru>=0.7.2",
     "pandas>=2.2.2,<3.0",
+    # pyarrow is imported directly in pipeline/writer.py (pa.Table, pq.write_table).
+    # pandas lists it only as an optional extra, so a fresh install without this
+    # explicit pin raises ModuleNotFoundError on the first scheduler tick.
+    # <20.0 guards against an unvalidated major-version jump.
+    "pyarrow>=15.0.0,<20.0",
     "numpy>=1.26.4",
     "scipy>=1.13.0",
     "py_vollib>=1.0.1",
