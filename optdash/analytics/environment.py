@@ -10,6 +10,17 @@ from optdash.analytics.pcr import get_pcr
 from optdash.analytics.vex_cex import get_vex_cex_current
 
 
+def _snap_to_min(t: str) -> int:
+    """Convert 'HH:MM' to integer minutes-since-midnight.
+
+    Using integer arithmetic makes all session boundary comparisons immune to
+    zero-padding differences (e.g. '9:15' vs '09:15') that would silently
+    mis-classify a session under lexicographic string comparison.
+    """
+    h, m = map(int, t.split(":"))
+    return h * 60 + m
+
+
 def get_environment_score(
     conn:       duckdb.DuckDBPyConnection,
     trade_date: str,
@@ -55,7 +66,12 @@ def get_environment_score(
         }
 
         # C2: V_CoC velocity (1 pt)
-        c2_met = abs(vcoc) > abs(settings.VCOC_BULL_THRESHOLD)
+        # Split into explicit bull/bear checks rather than abs() == abs()
+        # so future asymmetric threshold tuning (VCOC_BEAR_THRESHOLD != -VCOC_BULL)
+        # is handled correctly without changing this logic.
+        _vcoc_bull = abs(settings.VCOC_BULL_THRESHOLD)
+        _vcoc_bear = -_vcoc_bull  # symmetric today; override via VCOC_BEAR_THRESHOLD when added
+        c2_met = vcoc > _vcoc_bull or vcoc < _vcoc_bear
         conditions["vcoc_signal"] = {
             "met": c2_met, "value": round(vcoc, 2),
             "points": 1, "note": f"V_CoC 15m = {vcoc:+.2f}"
@@ -140,6 +156,17 @@ def get_environment_score(
             "note": "Dealer O'Clock guard *"
         }
 
+        # Assert that the sum of all condition points does not exceed GATE_MAX_SCORE.
+        # This fires at first use if a new condition is added without bumping
+        # GATE_MAX_SCORE in config.py — fail loudly here, not silently at
+        # the min() clamp which would just silently discard earned points.
+        _raw_max = sum(c["points"] for c in conditions.values())
+        assert _raw_max <= settings.GATE_MAX_SCORE, (
+            f"Gate conditions sum to {_raw_max} pts but "
+            f"GATE_MAX_SCORE={settings.GATE_MAX_SCORE}. "
+            "Update GATE_MAX_SCORE and re-calibrate thresholds in config.py."
+        )
+
         score   = min(
             sum(c["points"] for c in conditions.values() if c["met"]),
             settings.GATE_MAX_SCORE,
@@ -159,21 +186,34 @@ def get_environment_score(
         }
 
     except Exception as e:
-        logger.warning("get_environment_score error: {}", e)
+        logger.error(
+            "get_environment_score FATAL: {} {} {} | {}",
+            underlying, trade_date, snap_time, e,
+            exc_info=True,
+        )
         return {
-            "score": 0, "max_score": settings.GATE_MAX_SCORE,
-            "verdict": GateVerdict.NO_GO.value, "conditions": {}, "session": ""
+            "score":      0,
+            "max_score":  settings.GATE_MAX_SCORE,
+            "verdict":    GateVerdict.NO_GO.value,
+            "conditions": {},
+            "session":    "",
+            "error":      str(e),
         }
 
 
 def get_market_session(snap_time: str) -> MarketSession:
-    """Return the market session bucket for a given snap_time (HH:MM)."""
-    if snap_time <= settings.SESSION_OPENING_END:
+    """Return the market session bucket for a given snap_time (HH:MM).
+
+    Uses integer-minute arithmetic via _snap_to_min() to avoid lexicographic
+    string comparison pitfalls (e.g. '9:15' < '09:30' is False as strings).
+    """
+    s = _snap_to_min(snap_time)
+    if s <= _snap_to_min(settings.SESSION_OPENING_END):
         return MarketSession.OPENING
-    if snap_time <= settings.SESSION_MIDDAY_START:
+    if s <= _snap_to_min(settings.SESSION_MIDDAY_START):
         return MarketSession.MIDMORNING
-    if snap_time <= settings.SESSION_MIDDAY_END:
+    if s <= _snap_to_min(settings.SESSION_MIDDAY_END):
         return MarketSession.MIDDAY_CHOP
-    if snap_time <= settings.SESSION_CLOSING_START:
+    if s <= _snap_to_min(settings.SESSION_CLOSING_START):
         return MarketSession.AFTERNOON
     return MarketSession.CLOSING_CRUSH
