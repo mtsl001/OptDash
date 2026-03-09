@@ -39,29 +39,38 @@ async def lifespan(app: FastAPI):
     #    - SQLite scheduler conn    -> app.state.scheduler_journal
     await startup(app)
 
-    # 2. Start scheduler -- uses its own dedicated SQLite connection
-    #    (app.state.scheduler_journal) to avoid cross-thread sqlite3.Connection
-    #    access with the API thread pool (Fix-M proper / F-05).
-    scheduler = create_scheduler(
-        journal_conn=app.state.scheduler_journal,
-    )
-    scheduler.start()
-    app.state.scheduler = scheduler
-    logger.info(
-        "Scheduler started -- interval={}s, underlyings={}",
-        settings.SCHEDULER_INTERVAL_SECONDS,
-        settings.UNDERLYINGS,
-    )
-
-    yield
-
-    # 3. Graceful shutdown
-    logger.info("Shutting down OptDash...")
+    # 2. Start scheduler inside try/finally so DB connections are ALWAYS
+    #    closed, even if scheduler.start() raises (e.g. port conflict,
+    #    bad APScheduler config, import error in the tick function).
+    #    Previously, any exception here left DuckDB + both SQLite connections
+    #    open permanently because the code after `yield` was never reached.
+    scheduler = None
     try:
-        scheduler.shutdown(wait=False)
-    except Exception:
-        pass
-    await shutdown(app)
+        scheduler = create_scheduler(
+            journal_conn=app.state.scheduler_journal,
+        )
+        scheduler.start()
+        app.state.scheduler = scheduler
+        logger.info(
+            "Scheduler started -- interval={}s, underlyings={}",
+            settings.SCHEDULER_INTERVAL_SECONDS,
+            settings.UNDERLYINGS,
+        )
+
+        yield
+
+    finally:
+        # 3. Graceful shutdown -- guaranteed to run regardless of how we exit
+        #    (normal return, exception from scheduler.start(), or SIGINT).
+        logger.info("Shutting down OptDash...")
+        if scheduler is not None:
+            # scheduler is not None only if create_scheduler() succeeded AND
+            # scheduler.start() did not raise -- safe to shut down.
+            try:
+                scheduler.shutdown(wait=False)
+            except Exception:
+                pass
+        await shutdown(app)
 
 
 # Pass the full lifespan (with scheduler) into the app factory.
