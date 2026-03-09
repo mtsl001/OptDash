@@ -170,16 +170,17 @@ def get_environment_score(
             "note": "Dealer O'Clock guard *"
         }
 
-        # Assert that the sum of all condition points does not exceed GATE_MAX_SCORE.
+        # Guard: sum of all condition points must not exceed GATE_MAX_SCORE.
         # This fires at first use if a new condition is added without bumping
         # GATE_MAX_SCORE in config.py -- fail loudly here, not silently at
         # the min() clamp which would just silently discard earned points.
         _raw_max = sum(c["points"] for c in conditions.values())
-        assert _raw_max <= settings.GATE_MAX_SCORE, (
-            f"Gate conditions sum to {_raw_max} pts but "
-            f"GATE_MAX_SCORE={settings.GATE_MAX_SCORE}. "
-            "Update GATE_MAX_SCORE and re-calibrate thresholds in config.py."
-        )
+        if _raw_max > settings.GATE_MAX_SCORE:
+            raise RuntimeError(
+                f"Gate conditions sum to {_raw_max} pts but "
+                f"GATE_MAX_SCORE={settings.GATE_MAX_SCORE}. "
+                "Update GATE_MAX_SCORE and re-calibrate thresholds in config.py."
+            )
 
         score   = min(
             sum(c["points"] for c in conditions.values() if c["met"]),
@@ -199,6 +200,8 @@ def get_environment_score(
             "session":    session.value,
         }
 
+    except RuntimeError:
+        raise
     except Exception as e:
         logger.error(
             "get_environment_score FATAL: {} {} {} | {}",

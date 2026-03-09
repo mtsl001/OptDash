@@ -268,17 +268,18 @@ def _consecutive_no_go_count(jconn: sqlite3.Connection, trade_id: int) -> int:
     the last 10 rows, so the threshold could never be reached without any
     error or log warning. Fix:
       1. Read n from settings at call time so LIMIT always matches the threshold.
-      2. Assert n is in a safe range [1, 50] so misconfiguration is caught
+      2. Guard n is in a safe range [1, 50] so misconfiguration is caught
          immediately (first tracker tick / startup) rather than silently
          producing an always-false comparison in production.
       3. Embed n into LIMIT via f-string (safe: n is an int from settings,
          not user-controlled input).
     """
     n = settings.GATE_SUSTAINED_NO_GO_SNAPS
-    assert 1 <= n <= 50, (
-        f"GATE_SUSTAINED_NO_GO_SNAPS={n} out of safe range [1, 50]. "
-        "Raise the SQL LIMIT cap in _consecutive_no_go_count if needed."
-    )
+    if not (1 <= n <= 50):
+        raise RuntimeError(
+            f"GATE_SUSTAINED_NO_GO_SNAPS={n} out of safe range [1, 50]. "
+            "Raise the SQL LIMIT cap in _consecutive_no_go_count if needed."
+        )
     try:
         rows = jconn.execute(
             f"SELECT gate_verdict FROM position_snaps "
