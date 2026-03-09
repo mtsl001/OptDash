@@ -65,15 +65,31 @@ def get_available_underlyings(conn: duckdb.DuckDBPyConnection, trade_date: str) 
 
 def _safe_query(conn: duckdb.DuckDBPyConnection, sql: str, params: list = None) -> list[dict]:
     """
-    Execute a DuckDB query safely — returns [] if column does not exist
-    (handles optional columns like vex_k / cex_k in older Parquet files).
+    Execute a DuckDB query safely, returning [] only when an *optional column*
+    is absent from the Parquet schema (e.g. vex_k / cex_k in older files).
+
+    Suppression scope (intentionally narrow)
+    ----------------------------------------
+    Only ``duckdb.CatalogException`` where the message contains both
+    "column" and "does not exist" is suppressed.  This is the precise
+    fingerprint of a missing optional column.
+
+    Everything else -- including a missing ``options_data`` view, a missing
+    table, or any non-catalog error -- is re-raised so callers receive a
+    real error rather than silently empty results.  Previously the broad
+    ``"catalog error"`` string match also swallowed missing-view errors,
+    causing blank charts with no root-cause signal when startup
+    refresh_views() had failed.
     """
     try:
         result = conn.execute(sql, params or [])
         cols   = [d[0] for d in result.description]
         return [dict(zip(cols, row)) for row in result.fetchall()]
-    except Exception as e:
-        if "does not exist" in str(e).lower() or "catalog error" in str(e).lower():
-            logger.debug("Optional column missing — returning empty: {}", e)
+    except duckdb.CatalogException as e:
+        msg = str(e).lower()
+        if "column" in msg and "does not exist" in msg:
+            # Optional column absent in older Parquet files -- benign.
+            logger.debug("Optional column missing -- returning empty: {}", e)
             return []
+        # Missing view, missing table, or any other catalog error: propagate.
         raise
