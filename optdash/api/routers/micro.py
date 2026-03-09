@@ -1,20 +1,22 @@
 """Microstructure endpoints — PCR, alerts, volume velocity, VEX/CEX."""
 from fastapi import APIRouter, Depends, Query
 from optdash.api.deps import get_duck
+from optdash.api.validators import TradeDate, SnapTime
 from optdash.analytics.pcr import get_pcr_series
 from optdash.analytics.alerts import get_alerts
 from optdash.analytics.microstructure import get_volume_velocity
-from optdash.analytics.vex_cex import get_vex_cex_full   # was incorrectly get_vex_cex_series
+from optdash.analytics.vex_cex import get_vex_cex_full
+from optdash.config import settings
 
 router = APIRouter()
-
-DEFAULT_UNDERLYING = "NIFTY"
+# DEFAULT_UNDERLYING constant removed -- use settings.DEFAULT_UNDERLYING so
+# any .env override is respected without redeploying router code.
 
 
 @router.get("/pcr")
 def pcr(
-    trade_date: str = Query(...),
-    underlying: str = Query(DEFAULT_UNDERLYING),
+    trade_date: TradeDate = Query(...),
+    underlying: str       = Query(settings.DEFAULT_UNDERLYING),
     duck = Depends(get_duck),
 ):
     return get_pcr_series(duck, trade_date, underlying)
@@ -22,9 +24,9 @@ def pcr(
 
 @router.get("/alerts")
 def alerts(
-    trade_date: str = Query(...),
-    snap_time:  str = Query(...),
-    underlying: str = Query(DEFAULT_UNDERLYING),
+    trade_date: TradeDate = Query(...),
+    snap_time:  SnapTime  = Query(...),
+    underlying: str       = Query(settings.DEFAULT_UNDERLYING),
     duck = Depends(get_duck),
 ):
     return get_alerts(duck, trade_date, snap_time, underlying)
@@ -32,8 +34,8 @@ def alerts(
 
 @router.get("/volume-velocity")
 def volume_velocity(
-    trade_date: str = Query(...),
-    underlying: str = Query(DEFAULT_UNDERLYING),
+    trade_date: TradeDate = Query(...),
+    underlying: str       = Query(settings.DEFAULT_UNDERLYING),
     duck = Depends(get_duck),
 ):
     return get_volume_velocity(duck, trade_date, underlying)
@@ -41,9 +43,9 @@ def volume_velocity(
 
 @router.get("/vex-cex")
 def vex_cex(
-    trade_date: str = Query(...),
-    snap_time:  str = Query(...),
-    underlying: str = Query(DEFAULT_UNDERLYING),
+    trade_date: TradeDate = Query(...),
+    snap_time:  SnapTime  = Query(...),
+    underlying: str       = Query(settings.DEFAULT_UNDERLYING),
     duck = Depends(get_duck),
 ):
     return get_vex_cex_full(duck, trade_date, snap_time, underlying)
