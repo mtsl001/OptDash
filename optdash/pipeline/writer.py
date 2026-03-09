@@ -39,6 +39,16 @@ Performance
 At 75 snaps x ~500 strikes per underlying, a full daily file is
 ~37 500 rows.  pyarrow write of that size is typically <50 ms --
 well within the 5-minute scheduler tick budget.
+
+Schema enforcement (W-1)
+------------------------
+PARQUET_SCHEMA declares explicit dtypes for all 20 analytics columns.
+Passing it to pa.Table.from_pandas() prevents pandas dtype inference
+from producing int32/float32 columns on snaps where certain rows are
+absent (e.g. no futures rows -> Greeks inferred as int64 instead of
+float64). DuckDB union_by_name=true silently NULLs any column whose
+dtype drifts between daily files, corrupting gate scores and GEX
+calculations without any error or log entry.
 """
 from __future__ import annotations
 
@@ -52,6 +62,43 @@ from loguru import logger
 
 PROCESSED_SUBDIR   = "processed"
 _PARTITION_PREFIX  = "trade_date="
+
+# Canonical Parquet schema for all processed files.
+# Enforced at write time so dtype drift between daily files never produces
+# silent NULL columns when DuckDB reads them via union_by_name=true.
+#
+# Rules:
+#   - nullable=False: column must be present in every row (write fails loudly
+#     on missing data so upstream BQ feed gaps are caught at ingest time).
+#   - nullable=True:  column may be NULL (Greeks absent for spot/futures rows;
+#     dte absent for non-expiring instruments).
+#   - All price/Greek columns are float64 -- prevents int32/float32 drift from
+#     pandas inference that breaks DuckDB predicate pushdown min/max stats.
+#
+# MIGRATION NOTE: removing or renaming a column here is a breaking schema
+# change. Update REQUIRED_COLUMNS in duckdb_gateway.py to match any additions.
+PARQUET_SCHEMA = pa.schema([
+    pa.field("snap_time",       pa.string(),  nullable=False),
+    pa.field("underlying",      pa.string(),  nullable=False),
+    pa.field("strike_price",    pa.float64(), nullable=False),
+    pa.field("expiry_date",     pa.string(),  nullable=False),
+    pa.field("option_type",     pa.string(),  nullable=False),
+    pa.field("instrument_type", pa.string(),  nullable=True),
+    pa.field("ltp",             pa.float64(), nullable=True),
+    pa.field("iv",              pa.float64(), nullable=True),
+    pa.field("delta",           pa.float64(), nullable=True),
+    pa.field("theta",           pa.float64(), nullable=True),
+    pa.field("gamma",           pa.float64(), nullable=True),
+    pa.field("vega",            pa.float64(), nullable=True),
+    pa.field("spot",            pa.float64(), nullable=True),
+    pa.field("fut_price",       pa.float64(), nullable=True),
+    pa.field("oi",              pa.int64(),   nullable=True),
+    pa.field("volume",          pa.int64(),   nullable=True),
+    pa.field("gex",             pa.float64(), nullable=True),
+    pa.field("s_score",         pa.float64(), nullable=True),
+    pa.field("expiry_tier",     pa.string(),  nullable=True),
+    pa.field("dte",             pa.int32(),   nullable=True),
+])
 
 
 def parquet_path(data_root: Path, trade_date: str, underlying: str) -> Path:
@@ -120,7 +167,25 @@ def _write_snap_locked(
             ignore_index=True,
         )
 
-        table = pa.Table.from_pandas(merged, preserve_index=False)
+        # Fix W-1: enforce PARQUET_SCHEMA so every daily file has identical
+        # dtypes. safe=False raises ArrowInvalid immediately on cast failure
+        # rather than silently coercing bad values to NULL (safe=True default).
+        # This surfaces upstream BQ feed dtype changes at write time, not at
+        # query time when analytics return silent NULLs for gate/GEX columns.
+        try:
+            table = pa.Table.from_pandas(
+                merged,
+                schema=PARQUET_SCHEMA,
+                preserve_index=False,
+                safe=False,
+            )
+        except (pa.lib.ArrowInvalid, pa.lib.ArrowTypeError) as schema_err:
+            logger.error(
+                "[Writer] Schema cast failed for {}/{}: {}. "
+                "Verify BQ feed column dtypes match PARQUET_SCHEMA.",
+                trade_date, underlying, schema_err,
+            )
+            raise
 
         # F2 fix: write to .tmp then atomically rename.
         # Path.replace() is an atomic rename syscall on POSIX; DuckDB always
