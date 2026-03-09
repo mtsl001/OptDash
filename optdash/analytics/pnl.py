@@ -1,4 +1,4 @@
-"""PnL analytics — theta SL, Greeks attribution, theta clock."""
+"""PnL analytics -- theta SL, Greeks attribution, theta clock."""
 from typing import Any
 from loguru import logger
 from optdash.config import settings
@@ -7,10 +7,10 @@ from optdash.config import settings
 def compute_theta_sl(entry_premium: float, theta: float, minutes_elapsed: int) -> float:
     """
     Theta-adjusted stop loss.
-    SL floor rises as theta erodes time value — locks in decay-adjusted minimum exit.
-    Uses AI_SL_PCT from config (default 0.35 → SL at 65% of adjusted entry).
+    SL floor rises as theta erodes time value -- locks in decay-adjusted minimum exit.
+    Uses AI_SL_PCT from config (default 0.35 --> SL at 65% of adjusted entry).
     """
-    sl_multiplier  = 1.0 - settings.AI_SL_PCT    # honours config — not hardcoded
+    sl_multiplier  = 1.0 - settings.AI_SL_PCT    # honours config -- not hardcoded
     theta_per_min  = abs(theta or 0) / (6.5 * 60)
     decay          = theta_per_min * minutes_elapsed
     adjusted_entry = max(0.01, entry_premium - decay)
@@ -24,6 +24,13 @@ def compute_pnl_attribution(
     """
     Greeks-based PnL decomposition.
     Actual PnL = delta_pnl + gamma_pnl + vega_pnl + theta_pnl + unexplained.
+
+    Note on theta_pnl accuracy: the formula divides entry-snap theta by the
+    full 6.5-hour trading session. For short intraday holds (<= 90 min) this
+    is a reasonable first-order approximation. For holds > 120 min on near-
+    expiry options (DTE <= 3) theta is convex and entry-theta understates
+    erosion, inflating `unexplained`. A full fix requires recording per-snap
+    theta in position_snaps and integrating -- deferred as a schema change.
     """
     try:
         spot_chg = (current.get("spot", 0) or 0) - (entry.get("spot", 0) or 0)
@@ -42,6 +49,16 @@ def compute_pnl_attribution(
         gamma_pnl = round(0.5 * gamma * spot_chg ** 2, 2)
         vega_pnl  = round(vega * iv_chg, 2)
         theta_pnl = round(theta / (6.5 * 60) * minutes, 2)
+
+        # Warn when theta linearity assumption is most strained.
+        if minutes > 120 and (entry.get("dte") or 99) <= 3:
+            logger.debug(
+                "theta_pnl may understate decay: {}min hold on DTE={} option "
+                "-- unexplained={:.2f} includes convexity error",
+                minutes, entry.get("dte"),
+                round((delta_pnl + gamma_pnl + vega_pnl + theta_pnl)
+                      - round((current.get("ltp", 0) or 0) - (entry.get("premium", 0) or 0), 2), 2),
+            )
 
         theo_pnl    = delta_pnl + gamma_pnl + vega_pnl + theta_pnl
         entry_p     = entry.get("premium", 0)  or 0
@@ -66,24 +83,53 @@ def compute_pnl_attribution(
         }
 
 
-def compute_theta_clock(theta: float, dte: int, ltp: float, target: float) -> dict:
+def compute_theta_clock(
+    theta:     float,
+    dte:       int,
+    ltp:       float,
+    target:    float,
+    snap_time: str = "09:15",
+    status:    str = "IN_TRADE",
+) -> dict:
     """
     Time remaining before theta erosion exceeds the gap to target.
     Returns hours_remaining and is_urgent flag.
+
+    snap_time: current snap in 'HH:MM' format -- used to derive remaining
+               market minutes so theta_per_hour scales correctly intraday.
+               Defaults to '09:15' (most conservative) for old callers that
+               do not pass snap_time.
+    status:    only IN_TRADE / ACCEPTED positions need a theta clock;
+               returns null result for all other statuses.
     """
-    theta_per_hour = abs(theta or 0) / 6.5
-    gap_to_target  = max(0, (target or ltp) - (ltp or 0))
-    if theta_per_hour <= 0:
+    if status not in ("IN_TRADE", "ACCEPTED"):
         return {"hours_remaining": None, "is_urgent": False}
+
+    _MARKET_CLOSE_MIN = 15 * 60 + 30          # 15:30 in minutes
+    snap_min          = _snap_to_min(snap_time)
+    remaining_min     = max(30, _MARKET_CLOSE_MIN - snap_min)  # floor: 30 min
+
+    theta_per_hour = abs(theta or 0) / (remaining_min / 60)
+    gap_to_target  = max(0, (target or ltp) - (ltp or 0))
+
+    if theta_per_hour <= 0 or gap_to_target <= 0:
+        return {"hours_remaining": None, "is_urgent": False}
+
     hours = gap_to_target / theta_per_hour
     return {"hours_remaining": round(hours, 1), "is_urgent": hours < 1.5}
 
 
 def build_theta_sl_series(trade: dict, snaps: list[dict]) -> list[dict]:
-    """Build per-snap theta SL series for the position chart."""
+    """Build per-snap theta SL series for the position chart.
+
+    Uses actual_entry_price (slippage-adjusted fill) when set, falling back to
+    entry_premium. This matches the same fallback pattern used in tracker.py
+    and eod.py, ensuring the SL curve is anchored to the real fill price.
+    """
     sl_multiplier = 1.0 - settings.AI_SL_PCT   # consistent with compute_theta_sl
     result  = []
-    entry   = trade["entry_premium"]
+    # F6 fix: anchor SL curve to actual fill price, not recommendation premium.
+    entry   = trade.get("actual_entry_price") or trade["entry_premium"]
     theta   = trade.get("theta") or 0
     entry_t = trade.get("snap_time", "09:15")
     for snap in snaps:
@@ -106,6 +152,15 @@ def build_theta_sl_series(trade: dict, snaps: list[dict]) -> list[dict]:
             "unexplained":    snap.get("unexplained"),
         })
     return result
+
+
+def _snap_to_min(t: str) -> int:
+    """Convert 'HH:MM' to integer minutes-since-midnight."""
+    try:
+        h, m = map(int, t[:5].split(":"))
+        return h * 60 + m
+    except Exception:
+        return 9 * 60 + 15   # fallback: treat as market open
 
 
 def _minutes_between(t1: str, t2: str) -> int:
