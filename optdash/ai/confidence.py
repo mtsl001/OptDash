@@ -26,10 +26,10 @@ def compute_confidence(
     # Bucket 1: signal strength
     b1 = min(40, margin * 8 + signal_count * 2)
 
-    # Bucket 2: gate adequacy — P4-F5 (C4): multiplier corrected from 30 → 25.
-    # The old formula (gate/gate_max * 30, cap 25) meant gate_max-1 and
-    # gate_max both scored 25; the best gate earned no extra credit.
-    # New formula scales linearly: gate_max → 25, gate_max-1 → ~22, etc.
+    # Bucket 2: gate adequacy — P4-F5: corrected multiplier from 30 → 25.
+    # Old formula used * 30 against cap 25: gate_max and gate_max-1 both
+    # hit the ceiling, so the best gate earned no extra credit.
+    # Multiplier now equals cap so [0, gate_max] maps linearly to [0, 25].
     gate_max = settings.GATE_MAX_SCORE or 10
     b2 = min(25, int((gate_score / gate_max) * 25))
 
@@ -55,23 +55,16 @@ def compute_confidence(
     b3 = min(25, b3)
 
     # Bucket 4: historical performance — P4-F14b: cold-start guard.
-    #
-    # Old behaviour: get_session_stats() defaults win_rate to 50.0 when
-    # total=0 (no history). int(0.50 * 12) = 6, so a brand-new deployment
-    # started with 6 pts of phantom historical credit every tick.
-    #
-    # Fix: three tiers based on sample quality:
-    #   1. total_trades < 5        → b4 = 0       (cold start, no credit)
-    #   2. is_fallback, total < 20 → b4 ≤ 5       (thin global fallback)
-    #   3. real per-bucket sample  → b4 ≤ 10      (full credit)
-    total_trades = learning_stats.get("total_trades", 0)
+    # get_session_stats() falls back to global stats when the specific bucket
+    # (underlying + direction + session) has < min_trades closed trades, and
+    # returns is_fallback=True (P4-F15). When is_fallback is True OR total_trades
+    # < 5 (system cold-start with no meaningful history at all), zero out B4
+    # rather than granting int(0.50 * 12) = 6 pts of fictitious track-record
+    # credit that would bias confidence scores upward on a fresh deployment.
     is_fallback  = learning_stats.get("is_fallback", False)
-
-    if total_trades < 5:
+    total_trades = learning_stats.get("total_trades", 0)
+    if is_fallback or total_trades < 5:
         b4 = 0
-    elif is_fallback and total_trades < 20:
-        win_rate = learning_stats.get("win_rate", 50) / 100
-        b4 = min(5, int(win_rate * 12))
     else:
         win_rate = learning_stats.get("win_rate", 50) / 100
         b4 = min(10, int(win_rate * 12))

@@ -8,8 +8,8 @@ _ALLOWED_THRESHOLD_FIELDS = {"confidence", "gate_score", "s_score"}
 
 def get_session_stats(
     conn:       sqlite3.Connection,
-    underlying: str | None          = None,
-    direction:  str | None          = None,
+    underlying: str | None           = None,
+    direction:  str | None           = None,
     session:    MarketSession | None = None,
     min_trades: int = 10,
 ) -> dict:
@@ -17,9 +17,10 @@ def get_session_stats(
     Returns win_rate, avg_pnl, total_trades for the given filter bucket.
     Falls back to overall stats if the bucket has fewer than min_trades closed trades.
 
-    P4-F15: returns is_fallback bool and fallback_bucket_total so callers
-    (confidence.py B4) can cap historical credit when win_rate comes from
-    a thin global fallback rather than a real per-bucket sample.
+    P4-F15: return dict now includes `is_fallback: bool` so callers (e.g.
+    confidence.py) can detect when global stats were substituted and apply
+    cold-start discounting rather than granting B4 credits based on thin
+    or non-existent bucket history.
     """
     base_where = ["status='CLOSED'", "final_pnl_pct IS NOT NULL"]
     params: list = []
@@ -46,12 +47,12 @@ def get_session_stats(
         params
     ).fetchone()
 
-    # P4-F15: capture bucket size before the fallback check so we can report
-    # how thin the specific bucket was when returning global stats.
-    bucket_total = row[0] or 0
-    is_fallback  = False
-
-    if bucket_total < min_trades:
+    total = row[0] or 0
+    # P4-F15: capture fallback state before potentially overwriting `total`.
+    # was_fallback=True means the specific bucket (underlying+direction+session)
+    # had fewer than min_trades closed trades, so global stats were used.
+    was_fallback = total < min_trades
+    if was_fallback:
         # Fallback: global stats — not enough history in this specific bucket
         row = conn.execute(
             """SELECT COUNT(*),
@@ -60,9 +61,8 @@ def get_session_stats(
                FROM trades
                WHERE status='CLOSED' AND final_pnl_pct IS NOT NULL"""
         ).fetchone()
-        is_fallback = True
+        total = row[0] or 0
 
-    total    = row[0] or 0
     wins     = row[1] or 0
     avg_pnl  = round(float(row[2] or 0), 2)
     avg_conf = round(float(row[3] or 0), 1)
@@ -70,17 +70,12 @@ def get_session_stats(
     win_rate = round((wins / total * 100) if total else 50.0, 1)
 
     return {
-        "win_rate":             win_rate,
-        "avg_pnl":              avg_pnl,
-        "total_trades":         total,
-        "avg_confidence":       avg_conf,
-        "avg_gate":             avg_gate,
-        # P4-F15: fallback metadata for confidence.py B4 credibility discount.
-        # is_fallback=True means the win_rate is from global stats, not the
-        # specific session/direction/underlying bucket requested.
-        # fallback_bucket_total shows how sparse the original bucket was.
-        "is_fallback":          is_fallback,
-        "fallback_bucket_total": bucket_total if is_fallback else None,
+        "win_rate":       win_rate,
+        "avg_pnl":        avg_pnl,
+        "total_trades":   total,
+        "avg_confidence": avg_conf,
+        "avg_gate":       avg_gate,
+        "is_fallback":    was_fallback,  # P4-F15: True → global stats substituted
     }
 
 
