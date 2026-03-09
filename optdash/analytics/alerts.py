@@ -1,4 +1,4 @@
-"""Alert generation — transition-based signals from last 60 min of data."""
+"""Alert generation -- transition-based signals from last 60 min of data."""
 import duckdb
 from loguru import logger
 from optdash.config import settings
@@ -34,7 +34,7 @@ def get_alerts(
         pcr_w = recent(pcr_series)
         vol_w = recent(vol_series)
 
-        # Alert: GEX decline below 70%
+        # Alert: GEX decline below 70% (already has transition guard)
         if len(gex_w) >= 2:
             if gex_w[-1]["pct_of_peak"] < 70 and gex_w[-2]["pct_of_peak"] >= 70:
                 alerts.append(_make_alert(
@@ -43,17 +43,23 @@ def get_alerts(
                     severity=AlertSeverity.HIGH,
                     direction=None,
                     headline="GEX crossed below 70% of peak",
-                    message=f"Net GEX declined to {gex_w[-1]['pct_of_peak']:.0f}% — gamma pin weakening, directional move easier.",
+                    message=f"Net GEX declined to {gex_w[-1]['pct_of_peak']:.0f}% -- gamma pin weakening, directional move easier.",
                 ))
 
         # Alert: V_CoC velocity spike
-        if coc_w:
-            latest_coc = coc_w[-1]
-            vcoc = latest_coc.get("v_coc_15m", 0)
-            if latest_coc["signal"] in ("VELOCITY_BULL", "VELOCITY_BEAR"):
+        # F13a: transition guard -- only fire when signal changes FROM a
+        # non-velocity state TO a velocity state. Without this guard the
+        # alert fires on every tick while the signal holds, flooding the feed.
+        _velocity_signals = ("VELOCITY_BULL", "VELOCITY_BEAR")
+        if len(coc_w) >= 2:
+            cur_coc  = coc_w[-1]
+            prev_coc = coc_w[-2]
+            if (cur_coc["signal"]  in _velocity_signals and
+                    prev_coc["signal"] not in _velocity_signals):
+                vcoc = cur_coc.get("v_coc_15m", 0)
                 dir_ = "CE" if vcoc > 0 else "PE"
                 alerts.append(_make_alert(
-                    time=latest_coc["snap_time"],
+                    time=cur_coc["snap_time"],
                     type_=AlertType.COC_VELOCITY,
                     severity=AlertSeverity.HIGH,
                     direction=dir_,
@@ -61,8 +67,21 @@ def get_alerts(
                     message=f"Cost-of-carry velocity {vcoc:+.1f} indicates "
                             f"{'institutional long accumulation' if vcoc > 0 else 'institutional unwinding'}.",
                 ))
+        elif len(coc_w) == 1 and coc_w[0]["signal"] in _velocity_signals:
+            # Single snap in window (e.g. market just opened) -- fire once.
+            vcoc = coc_w[0].get("v_coc_15m", 0)
+            dir_ = "CE" if vcoc > 0 else "PE"
+            alerts.append(_make_alert(
+                time=coc_w[0]["snap_time"],
+                type_=AlertType.COC_VELOCITY,
+                severity=AlertSeverity.HIGH,
+                direction=dir_,
+                headline=f"V_CoC velocity spike: {vcoc:+.1f}",
+                message=f"Cost-of-carry velocity {vcoc:+.1f} indicates "
+                        f"{'institutional long accumulation' if vcoc > 0 else 'institutional unwinding'}.",
+            ))
 
-        # Alert: PCR divergence threshold cross
+        # Alert: PCR divergence threshold cross (already has transition guard)
         if len(pcr_w) >= 2:
             cur  = pcr_w[-1]["pcr_divergence"]
             prev = pcr_w[-2]["pcr_divergence"]
@@ -76,23 +95,36 @@ def get_alerts(
                     severity=sev,
                     direction=dir_,
                     headline=f"PCR divergence: {label} ({cur:+.3f})",
-                    message=f"PCR Vol-OI spread crossed {cur:+.3f} — retail positioning diverging, fade signal.",
+                    message=f"PCR Vol-OI spread crossed {cur:+.3f} -- retail positioning diverging, fade signal.",
                 ))
 
         # Alert: Volume spike
-        if vol_w:
-            latest_vol = vol_w[-1]
-            ratio = latest_vol["volume_ratio"]
-            if latest_vol["signal"] == "SPIKE":
-                sev = AlertSeverity.HIGH if ratio >= 3.0 else AlertSeverity.MEDIUM
+        # F13b: same transition guard pattern as V_CoC above.
+        if len(vol_w) >= 2:
+            cur_vol  = vol_w[-1]
+            prev_vol = vol_w[-2]
+            if cur_vol["signal"] == "SPIKE" and prev_vol["signal"] != "SPIKE":
+                ratio = cur_vol["volume_ratio"]
+                sev   = AlertSeverity.HIGH if ratio >= 3.0 else AlertSeverity.MEDIUM
                 alerts.append(_make_alert(
-                    time=latest_vol["snap_time"],
+                    time=cur_vol["snap_time"],
                     type_=AlertType.VOLUME_SPIKE,
                     severity=sev,
                     direction=None,
                     headline=f"Volume spike: {ratio:.1f}x baseline",
-                    message=f"Current volume {ratio:.1f}x above rolling median — unusual activity detected.",
+                    message=f"Current volume {ratio:.1f}x above rolling median -- unusual activity detected.",
                 ))
+        elif len(vol_w) == 1 and vol_w[0]["signal"] == "SPIKE":
+            ratio = vol_w[0]["volume_ratio"]
+            sev   = AlertSeverity.HIGH if ratio >= 3.0 else AlertSeverity.MEDIUM
+            alerts.append(_make_alert(
+                time=vol_w[0]["snap_time"],
+                type_=AlertType.VOLUME_SPIKE,
+                severity=sev,
+                direction=None,
+                headline=f"Volume spike: {ratio:.1f}x baseline",
+                message=f"Current volume {ratio:.1f}x above rolling median -- unusual activity detected.",
+            ))
 
     except Exception as e:
         logger.warning("get_alerts error: {}", e)
