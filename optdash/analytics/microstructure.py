@@ -1,11 +1,17 @@
-"""Microstructure analytics — volume velocity."""
+"""Microstructure analytics -- volume velocity."""
 import duckdb
 from loguru import logger
 
 
 def get_volume_velocity(conn: duckdb.DuckDBPyConnection, trade_date: str,
                         underlying: str) -> list[dict]:
-    """Full-day volume ratio vs rolling 10-snap median baseline."""
+    """Full-day volume ratio vs rolling 10-snap median baseline.
+
+    Index 0 (09:15 opening-auction snap) is excluded from all rolling
+    baseline windows. Its volume is typically 3-5x a normal snap due to
+    pre-market order accumulation and would suppress ratio readings for
+    the first ~50 minutes of the session if left in the window.
+    """
     try:
         rows = conn.execute("""
             SELECT snap_time, SUM(volume) AS vol_total
@@ -18,9 +24,20 @@ def get_volume_velocity(conn: duckdb.DuckDBPyConnection, trade_date: str,
         result = []
         vols = [r[1] or 0 for r in rows]
         for i, r in enumerate(rows):
-            window = vols[max(0, i - 10):i] if i > 0 else [vols[0]]
-            baseline = sorted(window)[len(window) // 2] if window else vols[i]
-            ratio = (vols[i] / baseline) if baseline else 1.0
+            if i == 0:
+                # Opening-auction snap: no prior baseline exists.
+                # ratio=1.0 (neutral) so it never triggers a false SPIKE alert.
+                # baseline stored as own volume for reference only.
+                ratio    = 1.0
+                baseline = vols[i]
+            else:
+                # Rolling 10-snap median window starting at index 1 (never 0).
+                # max(1, i-10) ensures the opening-auction snap is permanently
+                # excluded even for i=1..10 when the window would otherwise
+                # reach back to index 0.
+                window   = vols[max(1, i - 10):i]
+                baseline = sorted(window)[len(window) // 2] if window else vols[i]
+                ratio    = (vols[i] / baseline) if baseline else 1.0
             result.append({
                 "snap_time":    r[0],
                 "vol_total":    int(vols[i]),
