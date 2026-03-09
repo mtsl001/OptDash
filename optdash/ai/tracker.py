@@ -228,9 +228,14 @@ def _fetch_strike_current(
     back to pnl=0 and write a phantom zero-PnL closure in the journal.
     The <= query always returns the last known LTP for the contract, so exit
     premium and PnL are always based on real market data.
+
+    TRK-1: column names are now derived from cur.description instead of a
+    hardcoded list. If the SELECT order or column names ever change, the
+    returned dict keys automatically stay correct rather than silently
+    misaligning (e.g. iv receiving delta's value).
     """
     try:
-        row = conn.execute("""
+        cur = conn.execute("""
             SELECT ltp, iv, delta, theta, gamma, vega, spot
             FROM options_data
             WHERE trade_date=? AND snap_time<=? AND underlying=?
@@ -238,10 +243,12 @@ def _fetch_strike_current(
             ORDER BY snap_time DESC
             LIMIT 1
         """, [trade_date, snap_time, underlying,
-               strike_price, expiry, option_type]).fetchone()
+               strike_price, expiry, option_type])
+        cols = [d[0] for d in cur.description]
+        row  = cur.fetchone()
         if not row:
             return None
-        return dict(zip(["ltp", "iv", "delta", "theta", "gamma", "vega", "spot"], row))
+        return dict(zip(cols, row))
     except Exception as e:
         logger.warning("_fetch_strike_current error: {}", e)
         return None
