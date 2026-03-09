@@ -54,21 +54,26 @@ def generate_recommendation(
     direction = dir_res["direction"]
     session   = get_market_session(snap_time)
 
-    # ── Step 2: Gate — direction-aware so C9 (VEX, 2 pts) scores correctly ─────
+    # ── Step 2: Gate — direction-aware so C9 (VEX, 2 pts) scores correctly ───
     # Passing direction= ensures C9 awards points only when VEX aligns with the
     # actual CE/PE trade direction, not whenever VEX is non-zero.
     gate = get_environment_score(conn, trade_date, snap_time, underlying, direction=direction)
 
-    # ── Step 3: Supporting analytics ──────────────────────────────────────────
+    # ── Step 3: Supporting analytics ─────────────────────────────────────────────
     iv_data  = get_ivr_ivp(conn, trade_date, snap_time, underlying)
     gex_data = get_net_gex(conn, trade_date, snap_time, underlying)
-    # Fix-G: get_directional_bias() already called get_vex_cex_current() internally
-    # and exposes the result in dir_res["vex_data"]. Read it directly to avoid a
-    # second identical DuckDB round-trip. The 'or' fallback handles the rare case
-    # where direction.py hit an exception before computing vex (error return omits
-    # the key), keeping correctness without coupling to direction.py internals.
-    vex_data = dir_res.get("vex_data") or \
-               get_vex_cex_current(conn, trade_date, snap_time, underlying)
+    # Fix-G / F2: get_directional_bias() already computed get_vex_cex_current()
+    # internally and exposes the result as dir_res["vex_data"]. Read it directly
+    # to avoid a second identical DuckDB round-trip.
+    # F2 fix: use key-presence check (`"vex_data" in dir_res`) instead of
+    # truthiness (`dir_res.get("vex_data") or ...`). An empty dict `{}` is a
+    # valid result on quiet markets and is falsy, which incorrectly triggered
+    # the fallback get_vex_cex_current() call, defeating the optimisation.
+    vex_data = (
+        dir_res["vex_data"]
+        if "vex_data" in dir_res
+        else get_vex_cex_current(conn, trade_date, snap_time, underlying)
+    )
 
     dealer_oc = vex_data.get("dealer_oclock", False)
 
@@ -96,12 +101,12 @@ def generate_recommendation(
         )
         return None
 
-    # ── Learning context (session + direction specific win-rate) ────────────
+    # ── Learning context (session + direction specific win-rate) ──────────────
     learning = stats.get_session_stats(
         jconn, underlying=underlying, direction=direction, session=session
     )
 
-    # ── Confidence score ──────────────────────────────────────────────────
+    # ── Confidence score ────────────────────────────────────────────────────
     conf_result = compute_confidence(
         gate_score=gate["score"],
         direction_result=dir_res,
@@ -114,11 +119,11 @@ def generate_recommendation(
     )
     confidence = conf_result["confidence"]
 
-    # ── Pre-flight hard rules ─────────────────────────────────────────────
+    # ── Pre-flight hard rules ───────────────────────────────────────────────
     passed, failures = run_pre_flight(
         gate_score=gate["score"],
         confidence=confidence,
-        strike=strike,
+        strike={**strike, "underlying": underlying},
         gex_data={**gex_data, "max_pain_distance_pct": max_pain.get("distance_pct", 99)},
         session=session,
         existing_open_trades=len(open_trades),
@@ -130,14 +135,14 @@ def generate_recommendation(
         )
         return None
 
-    # ── SL / Target ─────────────────────────────────────────────────────
+    # ── SL / Target ────────────────────────────────────────────────────────
     sl     = round(entry_premium * (1 - settings.AI_SL_PCT), 2)
     target = round(entry_premium * settings.AI_TARGET_MULT, 2)
 
-    # ── Quality grade ──────────────────────────────────────────────────
+    # ── Quality grade ──────────────────────────────────────────────────────
     quality = compute_quality_score(strike, gate["score"], confidence)
 
-    # ── Narrative ─────────────────────────────────────────────────────────
+    # ── Narrative ───────────────────────────────────────────────────────────
     narrative = build_narrative(
         direction=direction,
         gate_score=gate["score"],
@@ -150,7 +155,7 @@ def generate_recommendation(
         dealer_oclock=dealer_oc,
     )
 
-    # ── Write to journal ──────────────────────────────────────────────────────
+    # ── Write to journal ─────────────────────────────────────────────────────────
     trade_id = trades.create_trade(jconn, {
         "trade_date":        trade_date,
         "snap_time":         snap_time,
@@ -194,12 +199,24 @@ def _nearest_expiry(
     snap_time:  str,
     underlying: str,
 ) -> str | None:
+    """Return the nearest TIER1 expiry date on or after trade_date.
+
+    F1: added AND expiry_tier='TIER1' and expiry_date >= ? (bind param).
+    Without the tier filter, MIN(expiry_date) could return a just-rolled
+    TIER2/TIER3 contract on Friday morning post-rollover, polluting
+    get_max_pain() with stale OI data and producing a wrong max_pain_dist
+    value in the pre-flight proximity check (Rule 4).
+    Using a bind param for the date floor avoids DuckDB column-scoping
+    ambiguity that the previous `expiry_date >= trade_date` column reference
+    could cause when trade_date also appears as a WHERE filter.
+    """
     try:
         row = conn.execute("""
             SELECT MIN(expiry_date) FROM options_data
             WHERE trade_date=? AND snap_time=? AND underlying=?
-              AND expiry_date >= trade_date
-        """, [trade_date, snap_time, underlying]).fetchone()
+              AND expiry_tier='TIER1'
+              AND expiry_date >= ?
+        """, [trade_date, snap_time, underlying, trade_date]).fetchone()
         return row[0] if row else None
     except Exception:
         return None
