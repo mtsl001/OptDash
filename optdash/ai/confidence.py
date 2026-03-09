@@ -26,11 +26,11 @@ def compute_confidence(
     # Bucket 1: signal strength
     b1 = min(40, margin * 8 + signal_count * 2)
 
-    # Bucket 2: gate adequacy
-    # F5: multiplier was 30 with cap 25, so gate=10 and gate=11 both yielded
-    # b2=25 (the cap). The best gate score got no extra credit over near-best.
-    # Fix: set multiplier == cap (25) so the mapping is linear and each gate
-    # step produces a unique b2 value up to the cap at perfect score.
+    # Bucket 2: gate adequacy — P4-F5: corrected multiplier from 30 to 25.
+    # The old formula used * 30 against a cap of 25, meaning gate_max and
+    # gate_max-1 both hit the cap (both scored 25). The best gate earned no
+    # extra credit over a near-perfect gate. Multiplier now equals the cap so
+    # the full [0, gate_max] range maps linearly to [0, 25].
     gate_max = settings.GATE_MAX_SCORE or 10
     b2 = min(25, int((gate_score / gate_max) * 25))
 
@@ -56,20 +56,13 @@ def compute_confidence(
     b3 = min(25, b3)
 
     # Bucket 4: historical performance
-    # F14b: default win_rate=50.0 gave B4=int(0.5*12)=6 even with zero closed
-    # trades, granting historical credit before any track record exists.
-    # Gate on total_trades: return 0 until at least 5 real closed trades.
-    # F15: if stats fell back to global data (thin specific bucket), cap B4
-    # at 5 to avoid over-crediting a broad average on an untested bucket.
-    total_trades = learning_stats.get("total_trades", 0)
-    if total_trades >= 5:
-        win_rate = learning_stats.get("win_rate", 50.0) / 100
-        b4 = min(10, int(win_rate * 12))
-        # Cap when global fallback is thin (< 20 trades in the specific bucket)
-        if learning_stats.get("is_fallback") and total_trades < 20:
-            b4 = min(b4, 5)
-    else:
-        b4 = 0  # no track record — no historical credit
+    # P4-F14b (cold-start guard) is applied here: if no real history exists,
+    # win_rate defaults to 50.0 in get_session_stats(), which feeds
+    # int(0.50 * 12) = 6 — granting 6 pts of credit with zero track record.
+    # The cold-start fix (gating B4 on total_trades >= 5) is applied in C6
+    # alongside the stats.py is_fallback changes.
+    win_rate = learning_stats.get("win_rate", 50) / 100
+    b4 = min(10, int(win_rate * 12))
 
     raw = b1 + b2 + b3 + b4
 
