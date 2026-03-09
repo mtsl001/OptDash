@@ -16,10 +16,7 @@ def get_net_gex(
     """Latest-snap GEX snapshot with regime classification.
 
     _peak_cache: optional dict shared by the caller across multiple get_net_gex
-    calls within the same scheduler tick. Format: {(trade_date, underlying): float}.
-    When provided, _get_gex_peak() is called at most once per (date, underlying)
-    pair rather than once per scheduler tick per underlying. Pass None (default)
-    for single ad-hoc API calls where caching is not needed.
+    calls within the same scheduler tick.
     """
     try:
         row = conn.execute("""
@@ -39,7 +36,6 @@ def get_net_gex(
         gex_near = (row[2] or 0) / settings.GEX_SCALING
         gex_far  = (row[3] or 0) / settings.GEX_SCALING
 
-        # Resolve day-peak GEX -- use cache when the caller provides one.
         cache_key = (trade_date, underlying)
         if _peak_cache is not None and cache_key in _peak_cache:
             peak = _peak_cache[cache_key]
@@ -48,7 +44,14 @@ def get_net_gex(
             if _peak_cache is not None:
                 _peak_cache[cache_key] = peak
 
-        pct    = (abs(gex_all) / peak * 100) if peak else 100.0
+        # Fix GEX-2: use != 0 guard (not truthy `if peak`) so a genuine
+        # peak=0 day (all strikes perfectly delta-hedged, net GEX = 0 all day)
+        # receives pct_of_peak=0 rather than 100.0.
+        # Old behaviour: `if peak else 100.0` treated 0 as falsy, set pct=100,
+        # then _classify_regime(0, 100) returned POSITIVE_CHOP (strong gamma
+        # wall) -- the exact opposite of the correct POSITIVE_DECLINING
+        # (neutral/declining gamma) classification for a zero-GEX environment.
+        pct    = (abs(gex_all) / peak * 100) if peak != 0 else 0.0
         regime = _classify_regime(gex_all, pct)
         return {
             "snap_time":   row[0],
@@ -81,11 +84,14 @@ def get_gex_series(conn: duckdb.DuckDBPyConnection, trade_date: str,
                trade_date, underlying]).fetchall()
         if not rows:
             return []
-        peak = max(abs(r[1] or 0) for r in rows) or 1.0
+        # Fix GEX-2: use max(...) or 0 (not or 1.0) so a zero-GEX day produces
+        # pct_of_peak=0 for every snap instead of artificially anchoring to 1.0.
+        peak = max(abs(r[1] or 0) for r in rows) or 0.0
         result = []
         for r in rows:
             gex         = r[1] or 0
-            pct_of_peak = round(abs(gex) / peak * 100, 1)
+            # Fix GEX-2: consistent != 0 guard in the series path.
+            pct_of_peak = round(abs(gex) / peak * 100, 1) if peak != 0 else 0.0
             regime      = _classify_regime(gex, pct_of_peak)
             result.append({
                 "snap_time":   r[0],
@@ -103,13 +109,7 @@ def get_gex_series(conn: duckdb.DuckDBPyConnection, trade_date: str,
 
 def get_spot_summary(conn: duckdb.DuckDBPyConnection, trade_date: str,
                      underlying: str) -> dict:
-    """Current spot with day OHLC and change pct.
-
-    Uses arg_max/arg_min (DuckDB ordered aggregates) so:
-      spot     = value at the LATEST snap_time (current price)
-      day_open = value at the FIRST  snap_time (opening price)
-    MAX(spot) and MIN(spot) remain correct for day high/low.
-    """
+    """Current spot with day OHLC and change pct."""
     try:
         row = conn.execute("""
             SELECT
@@ -145,12 +145,7 @@ def get_max_pain(
     underlying:   str,
     expiry_date:  str,
 ) -> dict:
-    """Max pain strike -- strike at which total option writers pay minimum.
-
-    Uses NumPy vectorised outer-subtraction to compute the pain matrix in one
-    pass. Equivalent to the prior O(N^2) Python loop but ~100x faster for
-    N >= 50 strikes (typical NIFTY chain has 80-120 active strikes).
-    """
+    """Max pain strike via vectorised NumPy outer-subtraction."""
     try:
         rows = conn.execute("""
             SELECT strike_price,
@@ -169,12 +164,9 @@ def get_max_pain(
         pe_arr      = np.array([r[2] or 0 for r in rows], dtype=float)
         spot        = rows[0][3] or 0
 
-        # Pain at each candidate strike s:
-        # sum over k of max(0, s-k)*ce_oi[k]  +  max(0, k-s)*pe_oi[k]
-        # Vectorised: outer-broadcast s and k axes, apply max(0,...), dot with OI.
-        diff        = strikes_arr[:, None] - strikes_arr[None, :]   # (N, N)
-        ce_pain_mat = np.maximum(0.0,  diff) * ce_arr               # CE pain per (s, k)
-        pe_pain_mat = np.maximum(0.0, -diff) * pe_arr               # PE pain per (s, k)
+        diff        = strikes_arr[:, None] - strikes_arr[None, :]
+        ce_pain_mat = np.maximum(0.0,  diff) * ce_arr
+        pe_pain_mat = np.maximum(0.0, -diff) * pe_arr
         pain_arr    = ce_pain_mat.sum(axis=1) + pe_pain_mat.sum(axis=1)
 
         min_idx    = int(np.argmin(pain_arr))
@@ -195,8 +187,8 @@ def _classify_regime(gex: float, pct_of_peak: float) -> GEXRegime:
     """Three-state GEX regime classification.
 
     NEGATIVE_TREND:     gex < 0  (dealers net short gamma -- trending market)
-    POSITIVE_DECLINING: gex > 0 but pct_of_peak <= GEX_DECLINE_THRESHOLD
-                        (gamma wall is weakening -- directional move building)
+    POSITIVE_DECLINING: gex >= 0 and pct_of_peak <= GEX_DECLINE_THRESHOLD
+                        (gamma wall weakening or absent -- directional move building)
     POSITIVE_CHOP:      gex > 0 and pct_of_peak > GEX_DECLINE_THRESHOLD
                         (strong gamma wall -- mean-reversion / choppy)
     """
@@ -209,7 +201,19 @@ def _classify_regime(gex: float, pct_of_peak: float) -> GEXRegime:
 
 def _get_gex_peak(conn: duckdb.DuckDBPyConnection, trade_date: str,
                   underlying: str) -> float:
-    """Day peak absolute GEX (denominator for pct_of_peak)."""
+    """Day peak absolute GEX (denominator for pct_of_peak).
+
+    Fix GEX-2: returns 0.0 (not 1.0) when the day's peak is genuinely zero
+    (all snaps have balanced GEX = 0). Returning 1.0 was a division guard
+    that masked the zero case: get_net_gex then set pct_of_peak=0/1*100=0
+    and _classify_regime(0, 0) returned POSITIVE_DECLINING -- accidentally
+    correct, but only because 0/1=0 happened to give the right pct value.
+    The critical failure was when gex_all was also non-zero but peak was
+    substituted with 1.0: pct_of_peak became abs(gex_all)*100 (off by a
+    factor of GEX_SCALING), producing wildly wrong regime classifications.
+    The `!= 0` guard in get_net_gex and get_gex_series now handles the
+    zero-peak case explicitly, making 0.0 the correct sentinel to return.
+    """
     try:
         row = conn.execute("""
             SELECT MAX(ABS(gex_sum)) FROM (
@@ -219,6 +223,8 @@ def _get_gex_peak(conn: duckdb.DuckDBPyConnection, trade_date: str,
                 GROUP BY snap_time
             )
         """, [settings.GEX_SCALING, trade_date, underlying]).fetchone()
-        return float(row[0]) if row and row[0] else 1.0
+        # Return 0.0 (not 1.0) when peak is None or genuinely 0 -- callers
+        # use `if peak != 0` to guard division, so 0.0 is the correct sentinel.
+        return float(row[0]) if row and row[0] else 0.0
     except Exception:
-        return 1.0
+        return 0.0
