@@ -1,8 +1,30 @@
 """Trades DAO — CRUD for the trades table."""
 import sqlite3
 
+# ---------------------------------------------------------------------------
+# Allowed column sets -- validated before any f-string SQL construction (F12)
+# ---------------------------------------------------------------------------
+_ALLOWED_TRADE_COLS: frozenset[str] = frozenset({
+    "trade_date", "snap_time", "accept_snap_time", "underlying", "option_type",
+    "strike_price", "expiry_date", "dte", "entry_premium", "actual_entry_price",
+    "sl_price", "target_price", "exit_premium", "exit_snap_time", "exit_reason",
+    "final_pnl_abs", "final_pnl_pct", "confidence", "gate_score", "gate_verdict",
+    "s_score", "quality_grade", "direction_signals", "narrative", "status",
+    "rejection_reason", "rejection_note", "session", "delta", "theta", "vega",
+    "gamma", "iv_at_entry", "spot_at_entry", "conf_buckets",
+    "recommendation_snap_time",
+})
+
 
 def create_trade(conn: sqlite3.Connection, data: dict) -> int:
+    """Insert a new trade row and return the new row id.
+
+    Raises ValueError if *data* contains any key not in _ALLOWED_TRADE_COLS
+    (prevents f-string SQL injection via unvalidated dict keys).
+    """
+    unknown = set(data.keys()) - _ALLOWED_TRADE_COLS
+    if unknown:
+        raise ValueError(f"create_trade: unknown column(s): {unknown}")
     cols         = ", ".join(data.keys())
     placeholders = ", ".join(["?"] * len(data))
     cur = conn.execute(
@@ -14,43 +36,62 @@ def create_trade(conn: sqlite3.Connection, data: dict) -> int:
 
 
 def get_trade(conn: sqlite3.Connection, trade_id: int) -> dict | None:
-    row = conn.execute(
-        "SELECT * FROM trades WHERE id=?", [trade_id]
-    ).fetchone()
-    return dict(row) if row else None
+    return _fetchone(
+        conn, "SELECT * FROM trades WHERE id=?", [trade_id]
+    )
 
 
 def get_open_trades(
-    conn: sqlite3.Connection, underlying: str | None = None
+    conn:         sqlite3.Connection,
+    underlying:   str | None = None,
+    max_age_days: int        = 3,
+    limit:        int        = 50,
 ) -> list[dict]:
-    q, params = "SELECT * FROM trades WHERE status='ACCEPTED'", []
+    """Return ACCEPTED trades younger than *max_age_days* calendar days.
+
+    max_age_days=3 (default): a trade open for 3 calendar days is almost
+    certainly a bug artifact (missed EOD close), not a live position.
+    Filtering stale rows prevents the scheduler from issuing one DuckDB
+    round-trip per stale trade per tick indefinitely.
+    """
+    q      = "SELECT * FROM trades WHERE status='ACCEPTED' AND trade_date >= date('now', ?)"
+    params = [f"-{max_age_days} days"]
     if underlying:
         q += " AND underlying=?"
         params.append(underlying)
-    q += " ORDER BY created_at DESC"
+    q += f" ORDER BY created_at DESC LIMIT {limit}"
     return _fetchall(conn, q, params)
 
 
 def get_pending_trades(
-    conn: sqlite3.Connection, underlying: str | None = None
+    conn:         sqlite3.Connection,
+    underlying:   str | None = None,
+    max_age_days: int        = 1,
+    limit:        int        = 50,
 ) -> list[dict]:
-    q, params = "SELECT * FROM trades WHERE status='GENERATED'", []
+    """Return GENERATED (pending) trades younger than *max_age_days* calendar days.
+
+    max_age_days=1 (default): a recommendation that was never
+    accepted/rejected after 1 day is expired stale data.
+    """
+    q      = "SELECT * FROM trades WHERE status='GENERATED' AND trade_date >= date('now', ?)"
+    params = [f"-{max_age_days} days"]
     if underlying:
         q += " AND underlying=?"
         params.append(underlying)
-    q += " ORDER BY created_at DESC"
+    q += f" ORDER BY created_at DESC LIMIT {limit}"
     return _fetchall(conn, q, params)
 
 
 def get_latest_trade(
-    conn: sqlite3.Connection, underlying: str
+    conn: sqlite3.Connection,
+    underlying: str,
 ) -> dict | None:
-    row = conn.execute(
-        """SELECT * FROM trades WHERE underlying=?
-           ORDER BY created_at DESC LIMIT 1""",
-        [underlying]
-    ).fetchone()
-    return dict(row) if row else None
+    return _fetchone(
+        conn,
+        "SELECT * FROM trades WHERE underlying=? ORDER BY created_at DESC LIMIT 1",
+        [underlying],
+    )
 
 
 def get_trade_history(
@@ -97,6 +138,7 @@ def update_status(
     trade_id:     int,
     status:       str,
     state_reason: str | None = None,
+    commit:       bool       = True,
 ) -> None:
     """Update trade status and optionally persist a state_reason.
 
@@ -104,7 +146,10 @@ def update_status(
     and preserves the existing value when state_reason is None --
     so a bare status update never clears a previously recorded reason.
 
-    Fix-H: previously state_reason was accepted but silently dropped.
+    commit=True  (default): commit immediately -- safe for standalone calls.
+    commit=False: leave the UPDATE in the current implicit transaction so
+    the caller can bundle multiple status updates (e.g. EOD sweep) into
+    one atomic transaction and commit once at the end (P6-F5).
     """
     conn.execute(
         """UPDATE trades
@@ -114,7 +159,8 @@ def update_status(
            WHERE id=?""",
         [status, state_reason, trade_id],
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def accept_trade(
@@ -176,7 +222,15 @@ def close_trade(
     conn:     sqlite3.Connection,
     trade_id: int,
     data:     dict,
+    commit:   bool = True,
 ) -> None:
+    """Close a trade and record exit data.
+
+    commit=True  (default): commit immediately -- safe for standalone calls.
+    commit=False: leave the UPDATE in the current implicit transaction so
+    the caller can batch multiple closes (e.g. EOD sweep) into one atomic
+    transaction and commit once at the end (P6-F5 EOD atomicity fix).
+    """
     conn.execute(
         """UPDATE trades
            SET status='CLOSED',
@@ -196,14 +250,37 @@ def close_trade(
             trade_id,
         ]
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 # -- Helpers ------------------------------------------------------------------
 
+def _fetchone(
+    conn:   sqlite3.Connection,
+    q:      str,
+    params: list,
+) -> dict | None:
+    """Execute query, return first row as dict or None.
+
+    Uses cursor.description zip so it works correctly regardless of
+    whether row_factory=sqlite3.Row is set on the connection (F14).
+    dict(row) was previously used, which silently returns integer-keyed
+    dicts on connections without row_factory.
+    """
+    cur = conn.execute(q, params)
+    row = cur.fetchone()
+    if row is None:
+        return None
+    cols = [d[0] for d in cur.description]
+    return dict(zip(cols, row))
+
+
 def _fetchall(conn: sqlite3.Connection, q: str, params: list) -> list[dict]:
     """Execute query and return list of dicts.
-    Requires row_factory=sqlite3.Row (set in deps.py and scheduler.py).
+
+    Uses cursor.description zip -- works correctly regardless of whether
+    row_factory=sqlite3.Row is set on the connection.
     Single-pass: one execute, one fetchall.
     """
     cur  = conn.execute(q, params)
