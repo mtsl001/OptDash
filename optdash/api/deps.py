@@ -31,6 +31,18 @@ silently corrupt its internal state.
 SQLite's WAL mode coordinates concurrent writes between the two connections at
 the file level safely -- this is exactly the use-case WAL was designed for.
 
+Ordering guarantee (P2-F10)
+---------------------------
+app.state.scheduler_journal is opened AFTER init_db(jconn) returns.
+SQLite WAL mode guarantees that any connection opened after a commit
+immediately sees the committed schema.  This ensures the scheduler
+cannot write against a partially-migrated schema on fast startup.
+
+Prerequisite: _run_migrations() must propagate real errors (not swallow
+them with bare except: pass) -- fixed in P1-F13 / schema.py.  Without
+that fix, init_db() can return early with an incomplete schema and
+this ordering guarantee is vacuous.
+
 This means both the full-stack run (run_api.py) and the standalone DB-only
 mode (uvicorn optdash.api.app:app) work correctly without any extra DuckDB
 wiring in the entry points -- the lifespan just calls deps.startup/shutdown.
@@ -78,12 +90,12 @@ async def startup(app: FastAPI) -> None:
     # Connection 1: API layer -- used by FastAPI sync endpoints
     # (anyio thread pool, separate OS thread from the event loop).
     jconn = _open_journal_conn(settings.JOURNAL_DB_PATH)
-    init_db(jconn)               # create tables + indexes (idempotent)
+    init_db(jconn)               # create tables + indexes + all migrations (idempotent)
     app.state.journal = jconn
 
-    # Connection 2: Scheduler -- used exclusively by the APScheduler tick
-    # coroutine (asyncio event loop thread). Kept separate so the scheduler
-    # never shares a sqlite3.Connection object with the API thread pool.
+    # Connection 2: Scheduler -- opened AFTER init_db() fully returns.
+    # WAL mode guarantees this connection sees the fully committed schema
+    # immediately (P2-F10 ordering guarantee -- see module docstring).
     sched_conn = _open_journal_conn(settings.JOURNAL_DB_PATH)
     app.state.scheduler_journal = sched_conn
 
@@ -97,10 +109,15 @@ async def shutdown(app: FastAPI) -> None:
     """Close DuckDB connection and both SQLite journal connections."""
     duck_shutdown()
     for attr in ("journal", "scheduler_journal"):
-        try:
-            getattr(app.state, attr).close()
-        except Exception:
-            pass
+        # Use getattr with a default of None so a never-set attribute
+        # (e.g. startup crashed before _open_journal_conn) doesn't raise
+        # AttributeError and mask the original startup failure in the log.
+        conn = getattr(app.state, attr, None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception as e:
+                logger.warning("Error closing SQLite connection '{}': {}", attr, e)
 
 
 def get_duck(request: Request):
