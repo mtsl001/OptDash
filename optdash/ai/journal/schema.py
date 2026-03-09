@@ -131,9 +131,15 @@ CREATE INDEX IF NOT EXISTS idx_trades_date            ON trades(trade_date);
 CREATE INDEX IF NOT EXISTS idx_trades_underlying      ON trades(underlying);
 CREATE INDEX IF NOT EXISTS idx_trades_status_ul       ON trades(status, underlying);
 CREATE INDEX IF NOT EXISTS idx_trades_session         ON trades(session);
-CREATE INDEX IF NOT EXISTS idx_snaps_trade            ON position_snaps(trade_id);
+-- Fix-P1-16: composite (trade_id, snap_time) replaces single-column (trade_id).
+-- get_snaps_for_trade() ORDER BY snap_time ASC and get_latest_snap()
+-- ORDER BY snap_time DESC LIMIT 1 both become index-only range scans.
+CREATE INDEX IF NOT EXISTS idx_snaps_trade_time       ON position_snaps(trade_id, snap_time);
 CREATE INDEX IF NOT EXISTS idx_shadow_trade_id        ON shadow_trades(trade_id);
-CREATE INDEX IF NOT EXISTS idx_shadow_date            ON shadow_trades(trade_date);
+-- Fix-P1-17: composite (trade_date, is_closed) for get_active_shadows().
+-- WHERE trade_date=? AND is_closed=0 is now a covering range scan;
+-- previously idx_shadow_date left a full row-level filter on is_closed.
+CREATE INDEX IF NOT EXISTS idx_shadow_active          ON shadow_trades(trade_date, is_closed);
 CREATE INDEX IF NOT EXISTS idx_shadow_snaps_shadow_id ON shadow_snaps(shadow_id);
 """
 
@@ -179,6 +185,16 @@ _MIGRATIONS = [
     # Fix-P1-14: accept_snap_time stores the acceptance snap; snap_time now
     # remains the immutable AI generation time for the lifetime of the row.
     "ALTER TABLE trades ADD COLUMN accept_snap_time   TEXT",
+
+    # Fix-P1-16: add composite covering index for position_snaps tick queries.
+    # Existing databases keep idx_snaps_trade (harmless single-col); the new
+    # composite index is preferred by the query planner for ORDER BY snap_time.
+    "CREATE INDEX IF NOT EXISTS idx_snaps_trade_time ON position_snaps(trade_id, snap_time)",
+
+    # Fix-P1-17: add composite index for get_active_shadows() active-shadow scan.
+    # Existing databases already have idx_shadow_date; this adds the is_closed
+    # predicate so WHERE trade_date=? AND is_closed=0 is a single covering scan.
+    "CREATE INDEX IF NOT EXISTS idx_shadow_active ON shadow_trades(trade_date, is_closed)",
 ]
 
 
