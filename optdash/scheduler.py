@@ -24,11 +24,16 @@ pattern (_make_jconn per tick) opened a new connection every 5 minutes,
 creating ~72 open/close cycles per trading day and bypassing the shared
 WAL-mode connection already maintained by the API layer.
 
-Both API request handlers and the scheduler run in the same asyncio event
-loop (AsyncIOScheduler).  Because all DuckDB calls are synchronous and
-never yield to the event loop, each tick runs atomically -- no concurrent
-DuckDB access is possible.
+Event-loop yielding
+-------------------
+Each major synchronous phase in tick() is followed by
+`await asyncio.sleep(0)` to release the event loop between phases.
+This allows HTTP request handlers and WS message dispatch to run
+between analytics phases without blocking for the full tick duration.
+All DuckDB calls remain on the same thread -- the shared in-process
+:memory: connection is not safe for concurrent multi-thread access.
 """
+import asyncio
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
@@ -216,6 +221,9 @@ def create_scheduler(
 
             # -- Step 1: Expire stale pending recommendations ------------------
             expire_stale_recommendations(jconn, trade_date, snap_time)
+            # Yield: allow HTTP/WS handlers queued during Step 1 to run before
+            # the heavier gate-cache computation in Step 2.
+            await asyncio.sleep(0)
 
             # -- GEX peak cache (shared across Steps 2 & 3) -------------------
             # Created fresh each tick so stale values from a prior tick never
@@ -235,6 +243,8 @@ def create_scheduler(
                 duck, trade_date, snap_time, jconn,
                 _gex_peak_cache=_gex_peak_cache,
             )
+            # Yield: allow HTTP/WS handlers to run before the recommender loop.
+            await asyncio.sleep(0)
 
             # -- Step 3: Generate new recommendations (per underlying) ---------
             for underlying in settings.UNDERLYINGS:
@@ -249,13 +259,19 @@ def create_scheduler(
                         rec.get("option_type"),
                         rec.get("strike_price"),
                     )
+                # Yield after each underlying so HTTP/WS handlers can interleave
+                # between per-underlying recommendation runs.
+                await asyncio.sleep(0)
 
             # -- Step 4: Track all open positions (gate_cache avoids N+1) ------
             track_open_positions(duck, jconn, trade_date, snap_time,
                                  gate_cache=gate_cache)
+            # Yield: allow HTTP/WS handlers to run before shadow tracking.
+            await asyncio.sleep(0)
 
             # -- Step 5: Track all shadow positions ----------------------------
             track_shadow_positions(duck, jconn, trade_date, snap_time)
+            # No yield needed -- end of tick.
 
         except Exception as e:
             logger.error("Scheduler tick error @ {}: {}", snap_time, e)

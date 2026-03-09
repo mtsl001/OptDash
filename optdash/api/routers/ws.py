@@ -1,4 +1,4 @@
-"""WebSocket — streams live snap updates to the frontend every 5 seconds."""
+"""WebSocket -- streams live snap updates to the frontend every 5 seconds."""
 import asyncio
 import json
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
@@ -60,7 +60,7 @@ async def live_feed(
                 await asyncio.sleep(settings.WS_INTERVAL_SECONDS)
                 continue
 
-            payload = _build_payload(duck, journal, trade_date, eff_snap, underlying)
+            payload = await _build_payload(duck, journal, trade_date, eff_snap, underlying)
             await ws.send_text(json.dumps(payload, default=str))
             await asyncio.sleep(settings.WS_INTERVAL_SECONDS)
 
@@ -79,13 +79,22 @@ def _latest_snap(duck, trade_date: str, underlying: str) -> str | None:
             [trade_date, underlying]
         ).fetchone()
         return row[0] if row else None
-    except Exception:
+    except Exception as e:
+        logger.warning("WS _latest_snap failed for {}/{}: {}", underlying, trade_date, e)
         return None
 
 
-def _build_payload(
+async def _build_payload(
     duck, journal, trade_date: str, snap_time: str, underlying: str
 ) -> dict:
+    """Async: build the full WS payload, yielding between each analytics phase.
+
+    Each `await asyncio.sleep(0)` releases the event loop for one iteration
+    so HTTP request handlers and other WS connections can be serviced between
+    analytics calls. All DuckDB access remains on the same thread -- the
+    shared in-process :memory: connection is not safe for concurrent
+    multi-thread access.
+    """
     try:
         # F3: fetch open trades FIRST so direction is available for the gate.
         # C9 (VEX alignment, 2 pts) only evaluates when direction is passed to
@@ -93,16 +102,23 @@ def _build_payload(
         # score permanently 0-2 pts lower than the recommender's internal gate.
         open_t    = trades.get_open_trades(journal, underlying=underlying)
         direction = open_t[0]["option_type"] if open_t else None
+        await asyncio.sleep(0)  # yield: allow other handlers to run
 
-        env    = get_environment_score(duck, trade_date, snap_time, underlying,
-                                       direction=direction)
-        gex    = get_net_gex(duck, trade_date, snap_time, underlying)
-        coc    = get_coc_latest(duck, trade_date, snap_time, underlying)
-        pcr    = get_pcr(duck, trade_date, snap_time, underlying)
-        vex    = get_vex_cex_current(duck, trade_date, snap_time, underlying)
-        alerts = get_alerts(duck, trade_date, snap_time, underlying)
+        env = get_environment_score(duck, trade_date, snap_time, underlying,
+                                    direction=direction)
+        await asyncio.sleep(0)  # yield: env score runs 7 aggregations
 
+        gex = get_net_gex(duck, trade_date, snap_time, underlying)
+        coc = get_coc_latest(duck, trade_date, snap_time, underlying)
+        await asyncio.sleep(0)  # yield
+
+        pcr = get_pcr(duck, trade_date, snap_time, underlying)
+        vex = get_vex_cex_current(duck, trade_date, snap_time, underlying)
+        await asyncio.sleep(0)  # yield
+
+        alerts  = get_alerts(duck, trade_date, snap_time, underlying)
         pending = trades.get_pending_trades(journal, underlying=underlying)
+        await asyncio.sleep(0)  # yield
 
         return {
             "snap_time":     snap_time,
