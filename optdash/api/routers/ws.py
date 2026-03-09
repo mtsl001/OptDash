@@ -1,6 +1,7 @@
 """WebSocket -- streams live snap updates to the frontend every 5 seconds."""
 import asyncio
 import json
+from datetime import date
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from loguru import logger
 
@@ -19,11 +20,29 @@ router = APIRouter()
 @router.websocket("/live")
 async def live_feed(
     ws:         WebSocket,
-    trade_date: str = Query(...),
+    trade_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
     snap_time:  str = Query("LIVE"),
     underlying: str = Query(settings.DEFAULT_UNDERLYING),   # F4: honour config
 ):
     await ws.accept()
+
+    # Fix WS-3: validate trade_date is a real calendar date after ws.accept()
+    # so the client receives a structured error over the WS channel.
+    # The Query pattern above rejects malformed strings at the HTTP upgrade
+    # level (400 before ws.accept()); this check catches structurally valid
+    # but impossible dates (e.g. '2026-02-30', '2026-13-01') that pass the
+    # regex but would cause every DuckDB bind to return empty results silently
+    # for the full lifetime of the connection.
+    try:
+        date.fromisoformat(trade_date)
+    except ValueError:
+        await ws.send_json({
+            "error": f"Invalid trade_date '{trade_date}': not a real calendar date. "
+                     "Format: YYYY-MM-DD (e.g. '2026-03-09')."
+        })
+        await ws.close()
+        return
+
     duck = ws.app.state.duck
 
     # F2: use the dedicated event-loop SQLite connection.
