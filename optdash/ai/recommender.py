@@ -1,4 +1,4 @@
-"""Full recommendation generation flow — orchestrates all AI modules."""
+"""Full recommendation generation flow -- orchestrates all AI modules."""
 import json
 import duckdb
 import sqlite3
@@ -36,7 +36,10 @@ def generate_recommendation(
     Called every scheduler tick for each underlying.
     Returns the generated trade card dict, or None if no recommendation issued.
     """
-    # Guard: open position exists — never recommend while in trade
+    # Guard: open position exists -- never recommend while in trade.
+    # This guarantee means existing_open_trades is always 0 by the time
+    # run_pre_flight() is called, so Rule 6 in pre_flight was dead code
+    # and has been removed. See pre_flight.py for details.
     open_trades = trades.get_open_trades(jconn, underlying=underlying)
     if open_trades:
         return None
@@ -46,7 +49,7 @@ def generate_recommendation(
     if pending:
         return None
 
-    # ── Step 1: Direction first — bail early on NEUTRAL to skip expensive calls ───
+    # -- Step 1: Direction first -- bail early on NEUTRAL to skip expensive calls
     dir_res = get_directional_bias(conn, trade_date, snap_time, underlying)
     if dir_res["direction"] == Direction.NEUTRAL.value:
         return None
@@ -54,10 +57,10 @@ def generate_recommendation(
     direction = dir_res["direction"]
     session   = get_market_session(snap_time)
 
-    # ── Step 2: Gate — direction-aware so C9 (VEX, 2 pts) scores correctly ─────
+    # -- Step 2: Gate -- direction-aware so C9 (VEX, 2 pts) scores correctly
     gate = get_environment_score(conn, trade_date, snap_time, underlying, direction=direction)
 
-    # ── Step 3: Supporting analytics ────────────────────────────────────────────────
+    # -- Step 3: Supporting analytics
     iv_data  = get_ivr_ivp(conn, trade_date, snap_time, underlying)
     gex_data = get_net_gex(conn, trade_date, snap_time, underlying)
 
@@ -79,7 +82,7 @@ def generate_recommendation(
         if nearest_expiry else {}
     )
 
-    # ── Best strike selection ────────────────────────────────────────────────
+    # -- Best strike selection
     strike_list = get_strikes(
         conn, trade_date, snap_time, underlying, top_n=settings.SCREENER_TOP_N
     )
@@ -88,21 +91,21 @@ def generate_recommendation(
         return None
     strike = candidates[0]
 
-    # Guard: zero or negative LTP means illiquid / expired strike — skip
+    # Guard: zero or negative LTP means illiquid / expired strike -- skip
     entry_premium = strike.get("ltp") or 0
     if entry_premium <= 0:
         logger.warning(
-            "Zero LTP for {} {} {} — skipping recommendation",
+            "Zero LTP for {} {} {} -- skipping recommendation",
             underlying, direction, strike.get("strike_price")
         )
         return None
 
-    # ── Learning context (session + direction specific win-rate) ──────────────
+    # -- Learning context (session + direction specific win-rate)
     learning = stats.get_session_stats(
         jconn, underlying=underlying, direction=direction, session=session
     )
 
-    # ── Confidence score ─────────────────────────────────────────────────────
+    # -- Confidence score
     conf_result = compute_confidence(
         gate_score=gate["score"],
         direction_result=dir_res,
@@ -115,14 +118,16 @@ def generate_recommendation(
     )
     confidence = conf_result["confidence"]
 
-    # ── Pre-flight hard rules ──────────────────────────────────────────────────
+    # -- Pre-flight hard rules
+    # existing_open_trades is not passed: the guard above (lines ~38-40)
+    # guarantees open_trades is empty before this point. Rule 6 has been
+    # removed from pre_flight.py to reflect this invariant.
     passed, failures = run_pre_flight(
         gate_score=gate["score"],
         confidence=confidence,
         strike=strike,
         gex_data={**gex_data, "max_pain_distance_pct": max_pain.get("distance_pct", 99)},
         session=session,
-        existing_open_trades=len(open_trades),
         dealer_oclock=dealer_oc,
     )
     if not passed:
@@ -131,14 +136,14 @@ def generate_recommendation(
         )
         return None
 
-    # ── SL / Target ─────────────────────────────────────────────────────────
+    # -- SL / Target
     sl     = round(entry_premium * (1 - settings.AI_SL_PCT), 2)
     target = round(entry_premium * settings.AI_TARGET_MULT, 2)
 
-    # ── Quality grade ───────────────────────────────────────────────────────
+    # -- Quality grade
     quality = compute_quality_score(strike, gate["score"], confidence)
 
-    # ── Narrative ────────────────────────────────────────────────────────────
+    # -- Narrative
     narrative = build_narrative(
         direction=direction,
         gate_score=gate["score"],
@@ -151,7 +156,7 @@ def generate_recommendation(
         dealer_oclock=dealer_oc,
     )
 
-    # ── Write to journal ───────────────────────────────────────────────────────────
+    # -- Write to journal
     trade_id = trades.create_trade(jconn, {
         "trade_date":        trade_date,
         "snap_time":         snap_time,
