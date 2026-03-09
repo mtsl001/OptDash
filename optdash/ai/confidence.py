@@ -27,7 +27,12 @@ def compute_confidence(
     b1 = min(40, margin * 8 + signal_count * 2)
 
     # Bucket 2: gate adequacy
-    b2 = min(25, int((gate_score / (settings.GATE_MAX_SCORE or 10)) * 30))
+    # F5: multiplier was 30 with cap 25, so gate=10 and gate=11 both yielded
+    # b2=25 (the cap). The best gate score got no extra credit over near-best.
+    # Fix: set multiplier == cap (25) so the mapping is linear and each gate
+    # step produces a unique b2 value up to the cap at perfect score.
+    gate_max = settings.GATE_MAX_SCORE or 10
+    b2 = min(25, int((gate_score / gate_max) * 25))
 
     # Bucket 3: structural quality
     # Guard ivp with explicit None check — ivp=0 is valid (historically cheapest IV)
@@ -51,8 +56,20 @@ def compute_confidence(
     b3 = min(25, b3)
 
     # Bucket 4: historical performance
-    win_rate = learning_stats.get("win_rate", 50) / 100
-    b4 = min(10, int(win_rate * 12))
+    # F14b: default win_rate=50.0 gave B4=int(0.5*12)=6 even with zero closed
+    # trades, granting historical credit before any track record exists.
+    # Gate on total_trades: return 0 until at least 5 real closed trades.
+    # F15: if stats fell back to global data (thin specific bucket), cap B4
+    # at 5 to avoid over-crediting a broad average on an untested bucket.
+    total_trades = learning_stats.get("total_trades", 0)
+    if total_trades >= 5:
+        win_rate = learning_stats.get("win_rate", 50.0) / 100
+        b4 = min(10, int(win_rate * 12))
+        # Cap when global fallback is thin (< 20 trades in the specific bucket)
+        if learning_stats.get("is_fallback") and total_trades < 20:
+            b4 = min(b4, 5)
+    else:
+        b4 = 0  # no track record — no historical credit
 
     raw = b1 + b2 + b3 + b4
 
