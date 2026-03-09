@@ -6,8 +6,16 @@ and can be called on every fresh connection without side effects.
 For existing databases, _run_migrations() uses ALTER TABLE to add new columns;
 SQLite raises OperationalError("duplicate column name") on re-runs, which is
 caught and silenced. All other errors propagate so startup fails loudly.
+
+Connection entry-point
+----------------------
+Always open journal connections via open_journal(path) defined below.
+This guarantees that PRAGMA foreign_keys, WAL mode, and busy_timeout
+are set on every connection -- SQLite resets them to defaults on each
+new connection object, so they must be re-applied every time.
 """
 import sqlite3
+from pathlib import Path
 
 CREATE_TRADES = """
 CREATE TABLE IF NOT EXISTS trades (
@@ -173,6 +181,35 @@ _MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN accept_snap_time   TEXT",
 ]
 
+
+# ---------------------------------------------------------------------------
+# Connection factory
+# ---------------------------------------------------------------------------
+
+def open_journal(path: Path) -> sqlite3.Connection:
+    """Open a journal SQLite connection with all required per-connection PRAGMAs.
+
+    Fix-P1-15: PRAGMA foreign_keys, WAL mode, and busy_timeout are
+    per-connection SQLite settings that default to OFF/DELETE/0 on every new
+    connection. Previously they were only set inside init_db(), so sched_conn
+    in deps.py and any test fixture using bare sqlite3.connect() had foreign-
+    key enforcement silently disabled: ON DELETE CASCADE on position_snaps and
+    shadow_trades would not fire, accumulating orphan rows invisibly.
+
+    This factory must be used for every journal connection in the codebase
+    (deps.py _open_journal_conn, scheduler.py, and test fixtures).
+    """
+    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")       # write-ahead log for concurrent reads
+    conn.execute("PRAGMA foreign_keys=ON")        # enable ON DELETE CASCADE etc.
+    conn.execute("PRAGMA busy_timeout=5000")      # wait up to 5 s instead of SQLITE_BUSY
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# Schema initialisation
+# ---------------------------------------------------------------------------
 
 def init_db(conn) -> None:
     """Create all tables and indexes, then apply any pending column migrations.
