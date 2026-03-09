@@ -74,7 +74,29 @@ class Settings(BaseSettings):
     #   MARKET_HOLIDAYS=["2026-03-14","2026-04-14","2026-04-18"]
     # The scheduler reads this via settings.MARKET_HOLIDAYS; a missing / empty
     # list simply disables the holiday skip without any error.
-    MARKET_HOLIDAYS: list[str] = []
+    #
+    # 2026 NSE TRADING holidays (dates where NSE is in closed_exchanges).
+    # Source: Upstox market-holidays API (verified Mar 2026).
+    # Excluded: settlement-only dates (Feb-19, Mar-19, Apr-01, Aug-26) and
+    # Diwali Muhurat session (Nov-08) where NSE trades with modified hours.
+    MARKET_HOLIDAYS: list[str] = [
+        "2026-01-15",  # Municipal Corporation Election
+        "2026-01-26",  # Republic Day
+        "2026-03-03",  # Holi
+        "2026-03-26",  # Ram Navami
+        "2026-03-31",  # Mahavir Jayanti
+        "2026-04-03",  # Good Friday
+        "2026-04-14",  # Dr. Baba Saheb Ambedkar Jayanti
+        "2026-05-01",  # Maharashtra Day
+        "2026-05-28",  # Bakri Id / Eid-ul-Adha
+        "2026-06-26",  # Muharram
+        "2026-09-14",  # Ganesh Chaturthi
+        "2026-10-02",  # Gandhi Jayanti
+        "2026-10-20",  # Dussehra
+        "2026-11-10",  # Diwali-Balipratipada
+        "2026-11-24",  # Guru Nanak Jayanti
+        "2026-12-25",  # Christmas
+    ]
 
     # -- Per-Underlying Market Metadata
     # Fix-P1-6: inner-type annotations added to all per-underlying dicts so
