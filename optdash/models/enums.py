@@ -31,13 +31,19 @@ class TradeStatus(str, Enum):
 
 
 class ExitReason(str, Enum):
-    TARGET_HIT    = "TARGET_HIT"
-    SL_HIT        = "SL_HIT"
-    THETA_SL_HIT  = "THETA_SL_HIT"
-    GATE_NO_GO    = "GATE_NO_GO"
-    IV_CRUSH      = "IV_CRUSH"
-    MANUAL_EXIT   = "MANUAL_EXIT"
-    EOD_FORCE     = "EOD_FORCE"
+    TARGET_HIT        = "TARGET_HIT"
+    SL_HIT            = "SL_HIT"
+    # Fix-P1-10: TRAILING_STOP_HIT added as a distinct exit reason.
+    # Previously tracker.py emitted SL_HIT as a proxy for trailing-stop exits,
+    # conflating two different exit types and corrupting per-reason outcome
+    # analysis in the learning engine (e.g. "pure SL_HIT" vs trailing stop).
+    # tracker.py must now emit ExitReason.TRAILING_STOP_HIT when the trail fires.
+    TRAILING_STOP_HIT = "TRAILING_STOP_HIT"
+    THETA_SL_HIT      = "THETA_SL_HIT"
+    GATE_NO_GO        = "GATE_NO_GO"
+    IV_CRUSH          = "IV_CRUSH"
+    MANUAL_EXIT       = "MANUAL_EXIT"
+    EOD_FORCE         = "EOD_FORCE"
 
 
 class RejectionReason(str, Enum):
