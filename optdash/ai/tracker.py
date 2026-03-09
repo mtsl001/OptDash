@@ -71,8 +71,8 @@ def track_open_positions(
         # entire tick silently for every open trade.
         #
         # trailing_active is True only when the dynamic trail (peak * 0.90)
-        # actually exceeds the theta SL, i.e. when the trailing rail — not the
-        # base theta SL — is the governing stop level. This lets the exit block
+        # actually exceeds the theta SL, i.e. when the trailing rail -- not the
+        # base theta SL -- is the governing stop level. This lets the exit block
         # emit the correct ExitReason (TRAILING_STOP_HIT vs SL_HIT).
         trailing_active = False
         if pnl_pct >= settings.TRAILING_STOP_ACTIVATION * 100:
@@ -134,7 +134,7 @@ def track_open_positions(
         # Auto-close path (trades.close_trade, commit=True default) will flush
         # the buffered snap + the CLOSED update together atomically if the
         # position exits. For positions that stay open, the single jconn.commit()
-        # after the loop issues one WAL flush for all remaining snaps — replacing
+        # after the loop issues one WAL flush for all remaining snaps -- replacing
         # the previous N individual flushes (one per open trade per tick).
         snaps.insert_snap(jconn, {
             "trade_id":        trade["id"],
@@ -159,9 +159,9 @@ def track_open_positions(
         exit_reason = None
         if ltp <= trail_sl:
             # P4-F8: emit the correct exit reason based on which stop governed.
-            # THETA_SL_HIT  — option decayed past the theta-adjusted SL.
-            # TRAILING_STOP_HIT — trailing rail (peak*0.90) was the active stop.
-            # SL_HIT        — plain fixed SL hit before any trailing activation.
+            # THETA_SL_HIT  -- option decayed past the theta-adjusted SL.
+            # TRAILING_STOP_HIT -- trailing rail (peak*0.90) was the active stop.
+            # SL_HIT        -- plain fixed SL hit before any trailing activation.
             exit_reason = (
                 ExitReason.THETA_SL_HIT.value      if theta_sl_status == "STOP_HIT"
                 else ExitReason.TRAILING_STOP_HIT.value if trailing_active
@@ -193,7 +193,7 @@ def track_open_positions(
 
     # P6-E: single WAL flush for all snaps buffered during this tick.
     # Positions that auto-closed above were already flushed by close_trade();
-    # this commit covers the remaining open-position snaps — one disk sync
+    # this commit covers the remaining open-position snaps -- one disk sync
     # per tick regardless of how many positions are being tracked.
     jconn.commit()
 
@@ -228,11 +228,6 @@ def _fetch_strike_current(
     back to pnl=0 and write a phantom zero-PnL closure in the journal.
     The <= query always returns the last known LTP for the contract, so exit
     premium and PnL are always based on real market data.
-
-    TRK-1: column names are now derived from cur.description instead of a
-    hardcoded list. If the SELECT order or column names ever change, the
-    returned dict keys automatically stay correct rather than silently
-    misaligning (e.g. iv receiving delta's value).
     """
     try:
         cur = conn.execute("""
@@ -275,13 +270,14 @@ def _consecutive_no_go_count(jconn: sqlite3.Connection, trade_id: int) -> int:
     the last 10 rows, so the threshold could never be reached without any
     error or log warning. Fix:
       1. Read n from settings at call time so LIMIT always matches the threshold.
-      2. Guard n is in a safe range [1, 50] so misconfiguration is caught
-         immediately (first tracker tick / startup) rather than silently
-         producing an always-false comparison in production.
+      2. RuntimeError replaces assert — guard fires even under python -O.
       3. Embed n into LIMIT via f-string (safe: n is an int from settings,
          not user-controlled input).
     """
     n = settings.GATE_SUSTAINED_NO_GO_SNAPS
+    # RuntimeError replaces assert — fires even under python -O.
+    # Outside the inner try-except so misconfiguration propagates to the
+    # scheduler tick error handler rather than being swallowed as return 0.
     if not (1 <= n <= 50):
         raise RuntimeError(
             f"GATE_SUSTAINED_NO_GO_SNAPS={n} out of safe range [1, 50]. "
