@@ -65,9 +65,21 @@ def track_open_positions(
         )
 
         # Trailing stop
-        if pnl_pct >= settings.TRAILING_STOP_ACTIVATION * 100:
+        # F8: guard get_peak_ltp() returning None on the first tick for a trade
+        # (no position_snaps rows exist yet). The old code executed
+        # `max(None * 0.90, sl_adjusted)` which raises TypeError and silently
+        # kills the entire scheduler tick for every open position.
+        # Also track trailing_active + peak_ltp so the exit path can emit the
+        # correct ExitReason.TRAILING_STOP_HIT instead of using SL_HIT as proxy.
+        trailing_active = pnl_pct >= settings.TRAILING_STOP_ACTIVATION * 100
+        peak_ltp = None
+        if trailing_active:
             peak_ltp = snaps.get_peak_ltp(jconn, trade["id"])
-            trail_sl = max(peak_ltp * 0.90, sl_adjusted)
+            trail_sl = (
+                max(peak_ltp * 0.90, sl_adjusted)
+                if peak_ltp is not None
+                else sl_adjusted  # no snaps yet -- fall back to theta SL
+            )
         else:
             trail_sl = sl_adjusted
 
@@ -136,13 +148,18 @@ def track_open_positions(
         })
 
         # Auto-close logic
+        # F8: emit TRAILING_STOP_HIT when the trail fires (trailing_active and
+        # ltp dropped below peak * 0.90). Previously SL_HIT was used as a proxy,
+        # conflating two distinct exit types and corrupting per-exit-reason
+        # learning analysis (e.g. pure SL_HIT rate vs trailing stop rate).
         exit_reason = None
         if ltp <= trail_sl:
-            exit_reason = (
-                ExitReason.THETA_SL_HIT.value
-                if theta_sl_status == "STOP_HIT"
-                else ExitReason.SL_HIT.value
-            )
+            if theta_sl_status == "STOP_HIT":
+                exit_reason = ExitReason.THETA_SL_HIT.value
+            elif trailing_active and peak_ltp is not None and ltp < peak_ltp * 0.90:
+                exit_reason = ExitReason.TRAILING_STOP_HIT.value
+            else:
+                exit_reason = ExitReason.SL_HIT.value
         elif ltp >= trade["target_price"]:
             exit_reason = ExitReason.TARGET_HIT.value
         elif gate_no_go and _consecutive_no_go_count(
@@ -229,6 +246,9 @@ def _snaps_since(entry_snap: str, current_snap: str) -> int:
 
 
 def _consecutive_no_go_count(jconn: sqlite3.Connection, trade_id: int) -> int:
+    # F9: LIMIT 10 is hardcoded here. The startup assertion in deps.py
+    # (added in C7) ensures GATE_SUSTAINED_NO_GO_SNAPS <= 10, so this
+    # count is always sufficient to detect a sustained NO_GO run.
     try:
         rows = jconn.execute("""
             SELECT gate_verdict FROM position_snaps
