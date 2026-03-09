@@ -32,10 +32,24 @@ def track_shadow_positions(
         if not current:
             continue
 
-        ltp     = current["ltp"]
-        pnl     = round((ltp - s["entry_premium"]) / s["entry_premium"] * 100, 2)
-        hit_sl  = ltp <= s["entry_premium"] * (1 - settings.AI_SL_PCT)
-        hit_tgt = ltp >= s["entry_premium"] * settings.AI_TARGET_MULT
+        ltp = current["ltp"]
+        pnl = round((ltp - s["entry_premium"]) / s["entry_premium"] * 100, 2)
+
+        # Fix SHA-2: use sl_price/target_price stored at shadow-creation time
+        # (written by api/routers/ai.py /reject) instead of recomputing from live
+        # config. If AI_SL_PCT or AI_TARGET_MULT changes, in-flight shadows must
+        # continue to use the parameters that were active when the recommendation
+        # was generated -- otherwise a config tightening immediately moves the
+        # goalposts on all open hypotheticals, corrupting the historical record.
+        #
+        # Fallback to live-config formula for legacy shadow rows created before
+        # sl_price/target_price columns were added (None == pre-migration row).
+        _sl  = s.get("sl_price")
+        _tgt = s.get("target_price")
+        hit_sl  = ltp <= (_sl  if _sl  is not None
+                          else s["entry_premium"] * (1 - settings.AI_SL_PCT))
+        hit_tgt = ltp >= (_tgt if _tgt is not None
+                          else s["entry_premium"] * settings.AI_TARGET_MULT)
 
         # F16: when this snap is the closing snap (SL or target hit), pass
         # commit=False so the INSERT stays in the open implicit transaction.
