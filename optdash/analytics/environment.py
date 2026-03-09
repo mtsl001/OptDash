@@ -22,11 +22,12 @@ def _snap_to_min(t: str) -> int:
 
 
 def get_environment_score(
-    conn:       duckdb.DuckDBPyConnection,
-    trade_date: str,
-    snap_time:  str,
-    underlying: str,
-    direction:  str | None = None,
+    conn:         duckdb.DuckDBPyConnection,
+    trade_date:   str,
+    snap_time:    str,
+    underlying:   str,
+    direction:    str | None = None,
+    _peak_cache:  dict | None = None,
 ) -> dict:
     """
     11-point environment gate.
@@ -37,9 +38,15 @@ def get_environment_score(
 
     direction must be 'CE' or 'PE'. If None, C9 does not fire (0 pts).
     All production callers (recommender, tracker) always pass direction.
+
+    _peak_cache: optional dict shared across multiple calls within the same
+    scheduler tick. Format: {(trade_date, underlying): float}. When provided,
+    get_net_gex() will populate and reuse the day-peak GEX value, avoiding
+    repeated full-day DuckDB scans. Pass None (default) for single API calls.
     """
     try:
-        gex_data = get_net_gex(conn, trade_date, snap_time, underlying)
+        gex_data = get_net_gex(conn, trade_date, snap_time, underlying,
+                               _peak_cache=_peak_cache)
         coc_data = get_coc_latest(conn, trade_date, snap_time, underlying)
         iv_data  = get_ivr_ivp(conn, trade_date, snap_time, underlying)
         pcr_data = get_pcr(conn, trade_date, snap_time, underlying)
@@ -158,7 +165,7 @@ def get_environment_score(
 
         # Assert that the sum of all condition points does not exceed GATE_MAX_SCORE.
         # This fires at first use if a new condition is added without bumping
-        # GATE_MAX_SCORE in config.py — fail loudly here, not silently at
+        # GATE_MAX_SCORE in config.py -- fail loudly here, not silently at
         # the min() clamp which would just silently discard earned points.
         _raw_max = sum(c["points"] for c in conditions.values())
         assert _raw_max <= settings.GATE_MAX_SCORE, (

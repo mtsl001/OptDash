@@ -82,7 +82,11 @@ def _eod_done_today(done_flags: dict) -> bool:
 
 
 def _build_gate_cache(
-    duck, trade_date: str, snap_time: str, jconn: sqlite3.Connection
+    duck,
+    trade_date:       str,
+    snap_time:        str,
+    jconn:            sqlite3.Connection,
+    _gex_peak_cache:  dict | None = None,
 ) -> dict:
     """Pre-compute gate scores for all currently open positions.
 
@@ -93,6 +97,12 @@ def _build_gate_cache(
 
     Gate is computed with the actual option_type (direction) so C9 (2 pts)
     scores correctly and NO_GO verdicts are not under-counted.
+
+    _gex_peak_cache: mutable dict passed in from tick(). When provided,
+    get_environment_score() -> get_net_gex() will populate it on first use
+    per (trade_date, underlying) and reuse it on subsequent calls, eliminating
+    redundant full-day DuckDB peak scans across _build_gate_cache and
+    generate_recommendation within the same tick.
     """
     open_trades = get_open_trades(jconn)
     cache: dict[str, dict] = {}
@@ -103,7 +113,9 @@ def _build_gate_cache(
         try:
             cache[underlying] = get_environment_score(
                 duck, trade_date, snap_time,
-                underlying, direction=t["option_type"]
+                underlying,
+                direction=t["option_type"],
+                _peak_cache=_gex_peak_cache,
             )
         except Exception as e:
             logger.warning("gate_cache pre-compute failed for {}: {}", underlying, e)
@@ -180,11 +192,24 @@ def create_scheduler(
             # -- Step 1: Expire stale pending recommendations ------------------
             expire_stale_recommendations(jconn, trade_date, snap_time)
 
+            # -- GEX peak cache (shared across Steps 2 & 3) -------------------
+            # Created fresh each tick so stale values from a prior tick never
+            # leak. Being a plain dict it is populated in-place by
+            # get_net_gex() -> _get_gex_peak() on first access per underlying,
+            # then reused for all subsequent calls within the same tick.
+            _gex_peak_cache: dict = {}
+
             # -- Step 2: Pre-compute gate cache for all open positions ---------
             # get_environment_score runs 7 DuckDB aggregations per underlying.
             # Caching here avoids repeating those queries once per open trade
             # inside track_open_positions() (Fix-L / F-04).
-            gate_cache = _build_gate_cache(duck, trade_date, snap_time, jconn)
+            # _gex_peak_cache is populated in-place during this call so
+            # Step 3 (generate_recommendation) reuses peak values already
+            # computed for open-position underlyings.
+            gate_cache = _build_gate_cache(
+                duck, trade_date, snap_time, jconn,
+                _gex_peak_cache=_gex_peak_cache,
+            )
 
             # -- Step 3: Generate new recommendations (per underlying) ---------
             for underlying in settings.UNDERLYINGS:
