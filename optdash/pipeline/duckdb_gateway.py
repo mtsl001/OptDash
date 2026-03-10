@@ -5,7 +5,7 @@ View scope
 Reads ONLY ``data/processed/trade_date=*/`` -- never ``data/raw/``.
 The raw subtree has a different schema (no Greeks, no enriched columns)
 and including it via union_by_name produces NULL rows for every
-analytic column (delta, iv, gex, s_score, ...).
+analytic column (delta, iv, gex, vex, cex, ...).
 
 File layout expected
 --------------------
@@ -59,10 +59,22 @@ PROCESSED_SUBDIR = "processed"
 # PnL calculations, and screener results without any error or log entry.
 # Validated against the registered view on every startup and EOD refresh so
 # schema drift is caught immediately, not at trade time.
+#
+# Sync rule: this set must mirror PARQUET_SCHEMA field names in writer.py.
+#   - s_score: REMOVED (computed live by screener.py, never in Parquet)
+#   - bid_qty / ask_qty: ADDED (mapped from total_buy/sell_qty in BQ feed;
+#       required by coc.py get_atm_obi/get_futures_obi and pcr.py _smoothed_obi;
+#       absence silently zeroes OBI and prevents Gates C3 + C6 from ever firing)
+#   - vex / cex: ADDED (Vanna + Charm Exposure; required by vex_cex.py)
+#   - oi / volume / dte: ADDED (were in PARQUET_SCHEMA but missing from this set)
 REQUIRED_COLUMNS: frozenset[str] = frozenset({
     "trade_date", "snap_time", "underlying", "strike_price", "expiry_date",
     "option_type", "instrument_type", "ltp", "iv", "delta", "theta",
-    "gamma", "vega", "spot", "fut_price", "gex", "s_score", "expiry_tier",
+    "gamma", "vega", "spot", "fut_price", "oi", "volume",
+    "bid_qty", "ask_qty",       # OBI columns (from total_buy / total_sell qty)
+    "gex", "vex", "cex",        # dealer exposure columns
+    "expiry_tier", "dte",       # enrichment columns
+    # NOT included: s_score (live compute), rho (not in Upstox API)
 })
 
 
