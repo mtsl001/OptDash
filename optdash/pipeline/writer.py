@@ -42,13 +42,27 @@ well within the 5-minute scheduler tick budget.
 
 Schema enforcement (W-1)
 ------------------------
-PARQUET_SCHEMA declares explicit dtypes for all 20 analytics columns.
+PARQUET_SCHEMA declares explicit dtypes for all 23 analytics columns.
 Passing it to pa.Table.from_pandas() prevents pandas dtype inference
 from producing int32/float32 columns on snaps where certain rows are
 absent (e.g. no futures rows -> Greeks inferred as int64 instead of
 float64). DuckDB union_by_name=true silently NULLs any column whose
 dtype drifts between daily files, corrupting gate scores and GEX
 calculations without any error or log entry.
+
+Column notes
+------------
+- option_type: nullable=True because FUT rows have no option_type (NULL).
+  Previously nullable=False caused ArrowInvalid crash on every futures write.
+- bid_qty / ask_qty: mapped from BQ total_buy_qty / total_sell_qty.
+  Required by coc.py get_atm_obi(), get_futures_obi() and pcr.py
+  _smoothed_obi(). Without these columns OBI is silently 0 and Gates C3/C6
+  never fire.
+- vex / cex: Vanna Exposure and Charm Exposure, computed by processor.py.
+  Required by vex_cex.py analytics.
+- s_score: REMOVED. Computed live by screener.py -- must never be stored
+  in Parquet (per-snap value would be stale immediately after write).
+- rho: NOT ADDED. Not provided by Upstox API / BQ feed.
 """
 from __future__ import annotations
 
@@ -71,7 +85,7 @@ _PARTITION_PREFIX  = "trade_date="
 #   - nullable=False: column must be present in every row (write fails loudly
 #     on missing data so upstream BQ feed gaps are caught at ingest time).
 #   - nullable=True:  column may be NULL (Greeks absent for spot/futures rows;
-#     dte absent for non-expiring instruments).
+#     dte absent for non-expiring instruments; option_type NULL for FUT rows).
 #   - All price/Greek columns are float64 -- prevents int32/float32 drift from
 #     pandas inference that breaks DuckDB predicate pushdown min/max stats.
 #
@@ -82,7 +96,7 @@ PARQUET_SCHEMA = pa.schema([
     pa.field("underlying",      pa.string(),  nullable=False),
     pa.field("strike_price",    pa.float64(), nullable=False),
     pa.field("expiry_date",     pa.string(),  nullable=False),
-    pa.field("option_type",     pa.string(),  nullable=False),
+    pa.field("option_type",     pa.string(),  nullable=True),   # NULL for FUT rows
     pa.field("instrument_type", pa.string(),  nullable=True),
     pa.field("ltp",             pa.float64(), nullable=True),
     pa.field("iv",              pa.float64(), nullable=True),
@@ -94,10 +108,15 @@ PARQUET_SCHEMA = pa.schema([
     pa.field("fut_price",       pa.float64(), nullable=True),
     pa.field("oi",              pa.int64(),   nullable=True),
     pa.field("volume",          pa.int64(),   nullable=True),
+    pa.field("bid_qty",         pa.int64(),   nullable=True),   # from total_buy_qty
+    pa.field("ask_qty",         pa.int64(),   nullable=True),   # from total_sell_qty
     pa.field("gex",             pa.float64(), nullable=True),
-    pa.field("s_score",         pa.float64(), nullable=True),
+    pa.field("vex",             pa.float64(), nullable=True),   # Vanna Exposure
+    pa.field("cex",             pa.float64(), nullable=True),   # Charm Exposure
     pa.field("expiry_tier",     pa.string(),  nullable=True),
     pa.field("dte",             pa.int32(),   nullable=True),
+    # REMOVED: s_score  -- computed live by screener.py, never stored in Parquet
+    # REMOVED: rho      -- not available from Upstox API / BQ feed
 ])
 
 
