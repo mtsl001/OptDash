@@ -98,14 +98,20 @@ def process_and_write(df: pd.DataFrame, duck_conn=None) -> str | None:
 # ── Internal pipeline steps ──────────────────────────────────────────────────
 
 def _strip_tz(df: pd.DataFrame) -> pd.DataFrame:
-    """Strip UTC tz-info from record_time without converting.
+    """Strip tz-info from record_time without any timezone conversion.
 
-    BQ stores record_time as UTC-labelled timestamps but the numeric values
-    are IST (no actual timezone conversion was applied at ingest time).
-    Stripping tz-info (not converting) preserves the correct IST wall-clock.
+    BQ returns record_time as a tz-aware Series (UTC-labelled) but the
+    numeric wall-clock values are IST — no actual UTC→IST conversion was
+    applied at ingest time. We strip tz-info only, preserving the IST
+    wall-clock numbers unchanged.
+
+    tz_localize(None) raises TypeError on an already-tz-aware Series;
+    tz_convert(None) is the correct call to detach tz-info from tz-aware
+    timestamps. Naive timestamps (no tz) pass through unchanged.
     """
     df = df.copy()
-    df["_rt"] = pd.to_datetime(df["record_time"]).dt.tz_localize(None)
+    rt = pd.to_datetime(df["record_time"])
+    df["_rt"] = rt.dt.tz_convert(None) if rt.dt.tz is not None else rt
     return df
 
 
