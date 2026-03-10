@@ -143,6 +143,59 @@ class Settings(BaseSettings):
     # 5 = full Mon-Fri week; increase for longer historical analytics.
     DUCK_VIEW_LOOKBACK_DAYS: int = 5
 
+    # ── BigQuery connection ────────────────────────────────────────────────────
+    # BQ_TABLE_ARCHIVE (upxtx_ar): full historical archive → used by backfill.
+    # BQ_TABLE_LIVE    (upxtx):    rolling live feed      → used by gap fill + incremental.
+    # upxtx is synced to upxtx_ar at 06:35 IST daily; upxtx then becomes empty
+    # until NSE market opens at 09:15 IST.
+    BQ_PROJECT:          str  = "universal-ion-437606-b7"
+    BQ_DATASET:          str  = "bgquery"
+    BQ_TABLE_ARCHIVE:    str  = "upxtx_ar"
+    BQ_TABLE_LIVE:       str  = "upxtx"
+    BQ_CREDENTIALS_PATH: Path = Path("service-account.json")
+
+    # ── Pipeline / Watermark ──────────────────────────────────────────────────
+    # WATERMARK_PATH: atomic JSON file tracking the last successfully processed
+    # record_time so incremental and gap-fill pulls do not re-process rows.
+    # BACKFILL_START_DATE: first trading day to pull from upxtx_ar.
+    # BACKFILL_END_DATE:   leave empty ("") to auto-set to yesterday at runtime.
+    # ENABLE_BACKFILL:     set False to skip backfill on startup (e.g. after
+    #                      first full load, or during development).
+    WATERMARK_PATH:      Path = Path("./data/watermark.json")
+    BACKFILL_START_DATE: str  = "2026-02-17"
+    BACKFILL_END_DATE:   str  = ""
+    ENABLE_BACKFILL:     bool = True
+
+    # BQ columns fetched in every pull. processor.py maps these to PARQUET_SCHEMA.
+    #
+    # Excluded intentionally:
+    #   close_price     — yesterday's settlement price; wrong as ltp fallback.
+    #   last_trade_time — not needed by any analytics module.
+    #   open/high/low   — not in PARQUET_SCHEMA; not used by any gate/screener.
+    #   pcr             — computed from OI sums by pcr.py; not stored raw.
+    #   rho             — not provided by Upstox API.
+    BQ_SELECT_COLS: list[str] = [
+        "record_time",
+        "underlying",
+        "instrument_type",    # OPTIDX / FUTIDX → normalised to OPT / FUT by processor
+        "instrument_key",     # used to identify FUT rows in processor; not written to Parquet
+        "option_type",        # CE / PE; NULL for futures rows
+        "expiry_date",        # M/D/YYYY in BQ → normalised to YYYY-MM-DD by processor
+        "strike_price",
+        "underlying_spot",    # → spot column in Parquet
+        "close",              # intraday running close → effective_ltp fallback (not close_price)
+        "ltp",                # primary price
+        "volume",
+        "oi",
+        "total_buy_qty",      # → bid_qty (cumulative day buy flow)
+        "total_sell_qty",     # → ask_qty (cumulative day sell flow)
+        "iv",                 # percentage, e.g. 21.33 (NOT decimal 0.2133)
+        "delta",
+        "theta",
+        "gamma",
+        "vega",
+    ]
+
     # -- GEX
     GEX_NEAR_WEEKS:        int   = 2
     GEX_DECLINE_THRESHOLD: float = 0.70  # 70% of peak -> declining
@@ -291,6 +344,20 @@ class Settings(BaseSettings):
 
     SESSION_MIDDAY_CONFIDENCE_PENALTY: int = 10
     SESSION_CLOSING_CONFIDENCE_CAP:    int = 60
+
+    # ── Computed BQ table FQNs (read-only properties) ────────────────────────
+    # Placed after all field_validators to comply with pydantic-settings
+    # class layout requirements. Override BQ_PROJECT / BQ_DATASET in .env
+    # and these automatically reflect the change.
+    @property
+    def BQ_FQN_ARCHIVE(self) -> str:
+        """Fully-qualified BQ table for historical archive (upxtx_ar)."""
+        return f"{self.BQ_PROJECT}.{self.BQ_DATASET}.{self.BQ_TABLE_ARCHIVE}"
+
+    @property
+    def BQ_FQN_LIVE(self) -> str:
+        """Fully-qualified BQ table for rolling live feed (upxtx)."""
+        return f"{self.BQ_PROJECT}.{self.BQ_DATASET}.{self.BQ_TABLE_LIVE}"
 
 
 settings = Settings()
