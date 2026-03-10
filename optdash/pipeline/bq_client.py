@@ -7,14 +7,8 @@ table_fqn parameter controls which BQ table is queried:
   settings.BQ_FQN_ARCHIVE  (upxtx_ar) — full history → backfill
   settings.BQ_FQN_LIVE     (upxtx)    — rolling live  → gap fill + incremental
 
-record_time in BQ is UTC-labeled but numerically IST.
-processor.py strips tz-info without converting (tz_localize(None)).
-
-Column selection is driven by settings.BQ_SELECT_COLS.
-Excluded deliberately:
-  close_price     — yesterday's settlement; wrong as ltp fallback
-  last_trade_time — not needed
-  rho             — not provided by Upstox API
+record_time in BQ is UTC-labelled but numerically IST.
+Processor strips tz-info without conversion — see processor._strip_tz().
 """
 from __future__ import annotations
 
@@ -29,11 +23,11 @@ from tenacity import (
 
 from optdash.config import settings
 
-_bq_client = None   # module-level singleton — created once, reused forever
+_bq_client = None   # module-level singleton; initialised on first get_bq_client() call
 
 
 def get_bq_client():
-    """Return (or create) the singleton BQ client."""
+    """Return singleton BQ client, creating it on first call."""
     global _bq_client
     if _bq_client is None:
         from google.oauth2 import service_account
@@ -65,13 +59,7 @@ def _cols() -> str:
 def pull_full_day(trade_date_str: str, table_fqn: str) -> pd.DataFrame:
     """Pull all rows for one calendar day from table_fqn.
 
-    Used by backfill.py against settings.BQ_FQN_ARCHIVE (upxtx_ar).
-
-    Parameters
-    ----------
-    trade_date_str : ISO date string e.g. '2026-03-07'
-    table_fqn      : fully-qualified BQ table name e.g.
-                     'universal-ion-437606-b7.bgquery.upxtx_ar'
+    Used by backfill (upxtx_ar). Returns empty DataFrame if no rows.
     """
     query = (
         f"SELECT {_cols()} FROM `{table_fqn}` "
@@ -91,14 +79,10 @@ def pull_full_day(trade_date_str: str, table_fqn: str) -> pd.DataFrame:
     reraise=True,
 )
 def pull_incremental(watermark: str, table_fqn: str) -> pd.DataFrame:
-    """Pull rows with record_time strictly after watermark.
+    """Pull rows with record_time > watermark from table_fqn.
 
-    Used by incremental.py against settings.BQ_FQN_LIVE (upxtx).
-
-    Parameters
-    ----------
-    watermark  : 'YYYY-MM-DD HH:MM:SS' naive string (tz-stripped IST value)
-    table_fqn  : fully-qualified BQ table name
+    Used by live incremental tick (upxtx). Returns empty DataFrame if
+    no new rows since last watermark (normal between feed cadence windows).
     """
     query = (
         f"SELECT {_cols()} FROM `{table_fqn}` "
@@ -118,21 +102,12 @@ def pull_incremental(watermark: str, table_fqn: str) -> pd.DataFrame:
     wait=wait_exponential(multiplier=2, min=4, max=60),
     reraise=True,
 )
-def pull_day_gap(
-    trade_date_str: str,
-    from_watermark: str,
-    table_fqn: str,
-) -> pd.DataFrame:
+def pull_day_gap(trade_date_str: str, from_watermark: str, table_fqn: str) -> pd.DataFrame:
     """Pull rows for one calendar day strictly after from_watermark.
 
-    Used by gap_fill.py against settings.BQ_FQN_LIVE (upxtx).
-    After the 06:35 IST sync upxtx is empty — returns 0 rows (not an error).
-
-    Parameters
-    ----------
-    trade_date_str : ISO date string e.g. '2026-03-10'
-    from_watermark : 'YYYY-MM-DD HH:MM:SS' — rows <= this timestamp are skipped
-    table_fqn      : fully-qualified BQ table name
+    Used by gap fill (upxtx). Handles the 06:35 IST sync scenario:
+    if upxtx is empty (post-sync, pre-market), returns empty DataFrame
+    which gap_fill.py logs as INFO (not WARNING).
     """
     query = (
         f"SELECT {_cols()} FROM `{table_fqn}` "
