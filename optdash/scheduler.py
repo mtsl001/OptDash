@@ -1,6 +1,8 @@
 """APScheduler -- drives recommendation generation and position tracking.
 
 Tick structure (every SCHEDULER_INTERVAL_SECONDS, market hours only):
+  0. Live BQ incremental pull (Step 0 -- NEW)
+                                  -> pull new snaps from upxtx since watermark
   1. Expire stale pending recommendations  -> once per tick (all underlyings)
   2. Pre-compute gate cache for open trades -> once per tick (all open positions)
   3. Generate recommendations              -> once per underlying
@@ -186,6 +188,22 @@ def create_scheduler(
             # Shared SQLite -- lifecycle owned by deps.shutdown().
             # Do NOT close jconn here.
             jconn = journal_conn
+
+            # -- Step 0: Live BQ incremental pull -----------------------------
+            # Pull new rows from upxtx since last watermark, write to today's
+            # Parquet file atomically. Blocking BQ I/O off the event loop.
+            # Import inside try so a missing google-cloud-bigquery install
+            # does not prevent the tick from running on non-BQ deployments.
+            # Non-fatal: exception logged, tick continues with last available
+            # data so recommendations and gate scores are not blocked.
+            try:
+                from optdash.pipeline.incremental import run_incremental_pull
+                new_data = await asyncio.to_thread(run_incremental_pull)
+                if new_data:
+                    logger.debug("[{}] Incremental BQ snap ingested.", snap_time)
+            except Exception as inc_err:
+                logger.error("Incremental BQ pull failed @ {}: {}", snap_time, inc_err)
+            await asyncio.sleep(0)
 
             # -- EOD sweep (once per calendar day) ----------------------------
             if _is_eod() and not _eod_done_today(done_flags):
