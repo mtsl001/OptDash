@@ -63,7 +63,6 @@ def get_strikes(
                     o.theta,
                     o.gamma,
                     o.vega,
-                    o.rho,
                     (o.strike_price - s.spot) / s.spot * 100              AS moneyness_pct,
                     o.oi * o.ltp / 1e7                                     AS liquidity_cr,
                     ABS(o.theta) / NULLIF(o.ltp, 0)                       AS eff_ratio,
@@ -117,7 +116,7 @@ def get_strikes(
 
         cols = [
             "expiry_date", "expiry_tier", "dte", "option_type", "strike_price",
-            "ltp", "iv", "delta", "theta", "gamma", "vega", "rho",
+            "ltp", "iv", "delta", "theta", "gamma", "vega",
             "moneyness_pct", "liquidity_cr", "eff_ratio", "s_score", "stars",
         ]
         return [
