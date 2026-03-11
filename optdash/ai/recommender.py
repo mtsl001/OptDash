@@ -104,12 +104,42 @@ def generate_recommendation(
 
     dealer_oc = vex_data.get("dealer_oclock", False)
 
-    # max_pain (optional metric -- None nearest_expiry is normal on non-TIER1 days)
+    # P1-12: nearest_expiry must be non-None to proceed.
+    #
+    # Root cause: on post-rollover Friday (current weekly expiry has passed,
+    # next weekly not yet in Parquet), _nearest_expiry() returns None.
+    # The previous code set max_pain={} and fell through to pre-flight, where
+    # max_pain.get('distance_pct', 99) returned 99.0 -- silently passing
+    # Rule 4 (max pain proximity) with a fake 'safely far' value.  This
+    # bypassed the most important proximity guard on expiry Friday, the
+    # highest-risk window in the weekly options cycle (charm distortion,
+    # early close, thin book).
+    #
+    # Fix: if TIER1 expiry chain is absent, the data is incomplete -- skip
+    # this tick and wait for the next scheduler cycle.  The skip is logged
+    # as INFO so the operator knows why no recommendation was issued.
     try:
         nearest_expiry = _nearest_expiry(conn, trade_date, snap_time, underlying)
-        max_pain = (
-            get_max_pain(conn, trade_date, snap_time, underlying, expiry_date=nearest_expiry)
-            if nearest_expiry else {}
+    except Exception:
+        logger.warning(
+            "P2-E: _nearest_expiry failed for {} {} {} -- skipping tick",
+            underlying, trade_date, snap_time, exc_info=True,
+        )
+        return None
+
+    if nearest_expiry is None:
+        # P1-12: no TIER1 expiry available -- post-rollover window or data gap.
+        # Do NOT proceed with max_pain={} as that silences the proximity check.
+        logger.info(
+            "P1-12: no TIER1 expiry found for {} {} {} -- skipping tick "
+            "(post-rollover window or missing Parquet data)",
+            underlying, trade_date, snap_time,
+        )
+        return None
+
+    try:
+        max_pain = get_max_pain(
+            conn, trade_date, snap_time, underlying, expiry_date=nearest_expiry
         )
     except Exception:
         logger.warning(
@@ -267,6 +297,9 @@ def _nearest_expiry(
     MIN(expiry_date) cannot return the just-expired weekly contract.
     Changed expiry_date >= trade_date column-self-ref to a parameterised
     bind so the intent is explicit and safe against schema renames.
+
+    Returns None when no TIER1 expiry exists for today -- caller (P1-12)
+    must treat None as a hard skip, not a safe default.
     """
     try:
         row = conn.execute("""
