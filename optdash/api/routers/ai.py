@@ -1,6 +1,7 @@
 """AI endpoints - recommendation, accept/reject, position, journal, learning."""
 import json
 import sqlite3
+import threading
 import time
 from typing import Annotated
 from fastapi import APIRouter, Depends, Query, HTTPException
@@ -55,8 +56,20 @@ class CloseRequest(BaseModel):
 
 
 # -- Learning report TTL cache ------------------------------------------------
-_report_cache: dict[int, dict] = {}
-_REPORT_TTL   = 60   # seconds
+# P1-1: _report_cache_lock guards _report_cache against concurrent access from
+# anyio's thread pool.  FastAPI runs sync (def) endpoints in worker threads --
+# two simultaneous /learning/report requests at the TTL boundary both miss the
+# cache and both call build_learning_report() (8 SQLite queries) concurrently
+# on the shared app.state.journal connection (check_same_thread=False, not
+# truly thread-safe).  The lock uses a double-checked locking pattern:
+#   1. Fast path: acquire lock, check hit, return immediately (microseconds).
+#   2. Miss path: release lock, run expensive query outside the lock so other
+#      endpoints are not blocked during the ~200ms SQLite scan.
+#   3. Write path: re-acquire lock, re-check expiry (another thread may have
+#      just written a fresh result while we were computing), then write.
+_report_cache:      dict[int, dict] = {}
+_report_cache_lock: threading.Lock  = threading.Lock()
+_REPORT_TTL = 60   # seconds
 
 
 # -- Response helpers ---------------------------------------------------------
@@ -253,9 +266,29 @@ def learning_report(
     days: int = Query(30, ge=7, le=365),
     jconn: sqlite3.Connection = Depends(get_journal),
 ):
-    cached = _report_cache.get(days)
-    if cached and (time.monotonic() - cached["ts"]) < _REPORT_TTL:
-        return cached["data"]
+    """Return the learning report for the last `days` trading days.
+
+    P1-1: double-checked locking pattern against _report_cache_lock.
+    - Fast path (cache hit): lock acquired for microseconds, result returned.
+    - Miss path: expensive build_learning_report() runs OUTSIDE the lock
+      so other HTTP endpoints are not blocked during the ~200ms SQLite scan.
+    - Write path: re-acquire lock and re-check expiry before writing, so a
+      second thread that waited at the lock boundary does not overwrite a
+      result just written by the first thread.
+    """
+    # --- fast path: cache hit ---
+    with _report_cache_lock:
+        cached = _report_cache.get(days)
+        if cached and (time.monotonic() - cached["ts"]) < _REPORT_TTL:
+            return cached["data"]
+
+    # --- miss path: build outside the lock ---
     data = build_learning_report(jconn, days=days)
-    _report_cache[days] = {"data": data, "ts": time.monotonic()}
+
+    # --- write path: double-check before storing ---
+    with _report_cache_lock:
+        cached = _report_cache.get(days)
+        if not cached or (time.monotonic() - cached["ts"]) >= _REPORT_TTL:
+            _report_cache[days] = {"data": data, "ts": time.monotonic()}
+
     return data
