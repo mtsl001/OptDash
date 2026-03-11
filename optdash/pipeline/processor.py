@@ -95,7 +95,7 @@ def process_and_write(df: pd.DataFrame, duck_conn=None) -> str | None:
     return new_wm
 
 
-# ── Internal pipeline steps ──────────────────────────────────────────────────
+# ── Internal pipeline steps ──────────────────────────────────────────────
 
 def _strip_tz(df: pd.DataFrame) -> pd.DataFrame:
     """Strip tz-info from record_time without any timezone conversion.
@@ -254,6 +254,12 @@ def _compute_gex_vex_cex(df: pd.DataFrame, lot_size: int) -> pd.DataFrame:
 
     iv is percentage (e.g. 21.33) — divide by 100 to get decimal σ.
     dte=0 (expiry day): sqrt_t=NaN → vex/cex=NaN (GEX still valid).
+
+    P0-3: vanna is clipped to [−VANNA_CLIP, +VANNA_CLIP] before the VEX
+    multiplication.  Near-zero IV rows from the NSE feed produce a
+    near-zero denominator, yielding vanna of 100–10,000+ that permanently
+    corrupts VEX totals in Parquet.  See config.py VANNA_CLIP for
+    calibration details.
     """
     df = df.copy()
     df["gex"] = np.nan
@@ -284,7 +290,13 @@ def _compute_gex_vex_cex(df: pd.DataFrame, lot_size: int) -> pd.DataFrame:
     denom  = (opts["spot"] * sigma * sqrt_t).replace(0, np.nan)
 
     # VEX
+    # P0-3: clip vanna before multiplying into VEX.  The replace(0, np.nan)
+    # above only catches exact-zero denominators; near-zero IV rows produce
+    # a small-but-nonzero denom and vanna of 100–10,000+.  Clipping to
+    # [-VANNA_CLIP, +VANNA_CLIP] (default ±50) absorbs all corrupt rows
+    # without ever affecting real option data (normal range: 0.0005–0.005).
     vanna        = opts["delta"] * (1.0 - opts["delta"].abs()) / denom
+    vanna        = vanna.clip(-settings.VANNA_CLIP, settings.VANNA_CLIP)  # P0-3
     opts["vex"]  = (opts["oi"] * lot_size * vanna * opts["spot"]) / _VEX_SCALE
 
     # CEX
