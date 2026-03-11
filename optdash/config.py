@@ -130,7 +130,7 @@ class Settings(BaseSettings):
         "NIFTYNXT50": 4,
     }
 
-    # -- Parquet Schema
+    # -- Parquet / DuckDB
     PARQUET_DATE_COL:       str  = "trade_date"
     PARQUET_SNAP_COL:       str  = "snap_time"
     PARQUET_UNDERLYING_COL: str  = "underlying"
@@ -143,6 +143,28 @@ class Settings(BaseSettings):
     # view, bounding scan cost regardless of how long the service runs.
     # 5 = full Mon-Fri week; increase for longer historical analytics.
     DUCK_VIEW_LOOKBACK_DAYS: int = 5
+
+    # P2-3: DuckDB engine settings — moved from hardcoded PRAGMAs in
+    # duckdb_gateway.startup() to config so they can be tuned per deployment
+    # via .env without a code change.
+    #
+    # DUCKDB_THREADS: number of threads DuckDB uses for parallel query
+    # execution.  Set to 0 to let DuckDB auto-detect the optimal count for
+    # the host CPU (recommended on multi-core servers).  Default 4 preserves
+    # the previous hardcoded value.
+    #   Override: DUCKDB_THREADS=8   (8-core server)
+    #             DUCKDB_THREADS=0   (auto-detect)
+    #             DUCKDB_THREADS=1   (single-core VPS / container)
+    #
+    # DUCKDB_MEMORY_LIMIT: maximum memory DuckDB may use before spilling to
+    # disk.  Should be set to ~75% of available RAM to leave headroom for
+    # Python/FastAPI heap and the BQ/Parquet I/O buffers.
+    # On an 8 GB server: 6GB.  On a 1 GB VPS: 512MB.
+    # Default '2GB' preserves the previous hardcoded value.
+    #   Override: DUCKDB_MEMORY_LIMIT=6GB
+    #             DUCKDB_MEMORY_LIMIT=512MB
+    DUCKDB_THREADS:       int = 4
+    DUCKDB_MEMORY_LIMIT:  str = "2GB"
 
     # ── BigQuery connection ────────────────────────────────────────────────────
     # BQ_TABLE_ARCHIVE (upxtx_ar): full historical archive → used by backfill.
