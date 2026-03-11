@@ -56,6 +56,13 @@ not deadlock.
 view_lock() context manager is kept for callers that need an explicit
 wider lock scope (e.g. multi-statement transactions).  It is now
 redundant for single execute() calls but harmless -- RLock is reentrant.
+
+P2-3: DuckDB engine tuning via config
+--------------------------------------
+PRAGMA threads and memory_limit are now read from
+settings.DUCKDB_THREADS and settings.DUCKDB_MEMORY_LIMIT so they can
+be overridden in .env without a code change.  Defaults (4 threads,
+2 GB) preserve the previous hardcoded behaviour.
 """
 import threading
 import duckdb
@@ -240,11 +247,23 @@ def startup() -> "LockedConn":
     Raises RuntimeError if view registration or schema validation fails on
     startup so the process fails loudly rather than starting in a degraded
     no-analytics state.
+
+    P2-3: PRAGMA threads and memory_limit are read from
+    settings.DUCKDB_THREADS / settings.DUCKDB_MEMORY_LIMIT so they can
+    be tuned per deployment in .env without a code change.
     """
     global _conn
     _conn = duckdb.connect(database=":memory:", read_only=False)
-    _conn.execute("PRAGMA threads=4")
-    _conn.execute("PRAGMA memory_limit='2GB'")
+    # P2-3: use config values instead of hardcoded literals.
+    # Defaults in config.py (threads=4, memory_limit='2GB') preserve the
+    # previous behaviour for deployments that do not set these in .env.
+    _conn.execute(f"PRAGMA threads={settings.DUCKDB_THREADS}")
+    _conn.execute(f"PRAGMA memory_limit='{settings.DUCKDB_MEMORY_LIMIT}'")
+    logger.info(
+        "DuckDB engine: threads={}, memory_limit={}",
+        settings.DUCKDB_THREADS,
+        settings.DUCKDB_MEMORY_LIMIT,
+    )
     # raise_on_error=True: startup must fail loudly if Parquet files are
     # corrupted, the view cannot be registered, or required columns are missing.
     # The alternative -- starting with no options_data view or a schema gap --
