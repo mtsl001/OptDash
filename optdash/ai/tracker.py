@@ -1,6 +1,7 @@
 """Live position tracking -- called every scheduler tick."""
 import duckdb
 import sqlite3
+from datetime import date
 from loguru import logger
 from optdash.config import settings
 from optdash.models import IVCrushSeverity, ExitReason, TradeStatus
@@ -225,12 +226,33 @@ def expire_stale_recommendations(
     today's trade_date is an orphan from a prior session and is expired
     immediately with a distinct state_reason so it is visible in the log
     and learning report without polluting intraday expiry metrics.
+
+    P1-11: date comparison now uses date objects (date.fromisoformat()) rather
+    than raw string inequality.  ISO string ordering is lexicographically
+    correct for YYYY-MM-DD, but a malformed date (e.g. '11-03-2026' from a
+    locale change or misconfigured parameter) silently inverts the comparison
+    instead of raising. Parsing both sides makes the failure loud (ValueError
+    in the scheduler log) rather than silently allowing stale recommendations
+    to persist across sessions indefinitely.
     """
+    today_date = date.fromisoformat(trade_date)   # P1-11: parse once, reuse below
     pending = trades.get_pending_trades(jconn)
     for trade in pending:
+        # P1-11: parse trade_date as a date object for type-safe comparison.
+        # Raises ValueError (logged by scheduler) if either date string is
+        # malformed, making the format problem immediately visible.
+        try:
+            trade_dt = date.fromisoformat(trade["trade_date"])
+        except (ValueError, TypeError) as e:
+            logger.error(
+                "P1-11: malformed trade_date={!r} for trade id={} -- skipping expiry check: {}",
+                trade["trade_date"], trade["id"], e,
+            )
+            continue
+
         # P0-2: expire prior-session orphans immediately -- do not attempt
         # intraday age arithmetic across a session boundary.
-        if trade["trade_date"] < trade_date:
+        if trade_dt < today_date:
             trades.update_status(
                 jconn, trade["id"], TradeStatus.EXPIRED.value,
                 state_reason="Stale recommendation from prior session -- expired on new day open",
