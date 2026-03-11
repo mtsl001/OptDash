@@ -11,6 +11,18 @@ Non-fatal: per-date failures are logged and the loop continues so a
 single bad day does not block the app from starting. Contrast with
 backfill.py which is fatal (historical gaps are harder to recover).
 
+P2-10: watermark advance policy for empty BQ results on past days
+-----------------------------------------------------------------
+An empty pull_day_gap() result for a past day must NOT advance the
+watermark to 15:30:00.  upxtx (the live table) is emptied daily at
+06:35 -- so a 0-row result for a past day means either the data is
+already covered by backfill (upxtx_ar path) or there was a BQ outage.
+Advancing the watermark on 0 rows would permanently mark that day as
+complete and make any missing data unrecoverable without manual surgery.
+The safe default is: skip without advancing, log a WARNING, and let
+the next startup retry.  Backfill.py (upxtx_ar path) sets the watermark
+independently when it successfully writes data for a past day.
+
 Entry point: run_gap_fill(duck_conn=None)
 """
 from __future__ import annotations
@@ -62,20 +74,32 @@ def run_gap_fill(duck_conn=None) -> None:
 
             if df.empty:
                 if is_today and not is_within_market_hours():
-                    # Post-06:35 sync, pre-09:15 open: expected empty, backfill covered this day.
+                    # Post-06:35 sync, pre-09:15 open: expected empty.
+                    # Backfill (upxtx_ar path) has already covered this day.
                     logger.info(
                         "Gap fill: {} — 0 rows (post-sync window; market not open yet)", ds
                     )
-                else:
+                elif is_today:
+                    # During market hours: no new rows yet since last watermark.
                     logger.debug("Gap fill: {} — 0 rows (already current)", ds)
-
-                # Advance watermark to EOD for past days to prevent re-querying
-                # the same date on the next startup.
-                if not is_today:
-                    eod = f"{ds} 15:30:00"
-                    if eod > wm:
-                        wm_save(eod)
-                        wm = eod
+                else:
+                    # P2-10: empty result for a PAST day.
+                    # upxtx is the live table -- it is emptied at 06:35 daily.
+                    # A 0-row result means either:
+                    #   a) backfill already covered this day via upxtx_ar, OR
+                    #   b) there was a BQ outage / data gap.
+                    # Do NOT advance the watermark to EOD in case (b).
+                    # Log a WARNING so the operator is alerted.
+                    # The next startup will retry this date range.
+                    # Backfill.py sets the watermark independently when it
+                    # successfully writes data for this day from upxtx_ar.
+                    logger.warning(
+                        "Gap fill: {} — 0 rows from upxtx for a past day. "
+                        "Watermark NOT advanced (possible BQ outage or data gap). "
+                        "Backfill should have covered this via upxtx_ar. "
+                        "If backfill also missed it, manual re-ingest is needed.",
+                        ds,
+                    )
                 continue
 
             new_wm = process_and_write(df, duck_conn=duck_conn)
