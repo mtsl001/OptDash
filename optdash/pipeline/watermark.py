@@ -7,10 +7,9 @@ Atomicity: .tmp write then Path.replace() — POSIX atomic rename.
 Initial sentinel: one second before midnight on (BACKFILL_START_DATE − 1)
 so the very first pull_full_day() captures the full first backfill day.
 
-P2-12: saved_at is written as IST wall-clock time (not system-local / UTC).
-datetime.now(IST).replace(tzinfo=None) is used so the audit field matches
-the IST convention of last_record_time and is human-readable on VPS hosts
-whose OS timezone is UTC.
+P2-12: saved_at uses IST-aware datetime so the audit timestamp in the
+JSON reflects the correct IST wall-clock time regardless of the server
+OS timezone (UTC on most VPS / cloud deployments).
 """
 from __future__ import annotations
 
@@ -23,7 +22,7 @@ from loguru import logger
 
 from optdash.config import settings
 
-_IST = ZoneInfo("Asia/Kolkata")
+IST = ZoneInfo("Asia/Kolkata")
 
 
 def _initial_watermark() -> str:
@@ -48,18 +47,17 @@ def load(path: Path | None = None) -> str:
 def save(ts_str: str, path: Path | None = None) -> None:
     """Atomically persist watermark string. ts_str format: 'YYYY-MM-DD HH:MM:SS'.
 
-    P2-12: saved_at uses IST wall-clock via datetime.now(_IST).replace(tzinfo=None)
-    so the audit timestamp is human-readable on VPS hosts whose OS timezone is UTC.
+    P2-12: saved_at uses IST-aware datetime.now(IST).replace(tzinfo=None)
+    so the audit field shows IST wall-clock time in the JSON regardless of
+    the server OS timezone.  .replace(tzinfo=None) keeps the stored format
+    as 'YYYY-MM-DD HH:MM:SS' with no +05:30 suffix.
     """
     p = path or settings.WATERMARK_PATH
     p.parent.mkdir(parents=True, exist_ok=True)
-    # P2-12: datetime.now(_IST) gives the correct IST wall-clock time regardless
-    # of the server OS timezone.  .replace(tzinfo=None) strips the +05:30 suffix
-    # so the string format matches last_record_time ("YYYY-MM-DD HH:MM:SS").
-    saved_at = datetime.now(_IST).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
     payload = {
         "last_record_time": ts_str,
-        "saved_at":          saved_at,
+        # P2-12: IST wall-clock time, tz-info stripped for clean JSON format.
+        "saved_at": datetime.now(IST).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S"),
     }
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, indent=2))
