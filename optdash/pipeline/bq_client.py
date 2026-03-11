@@ -1,7 +1,7 @@
 """bq_client.py — BigQuery auth + pull functions with retry.
 
 Singleton pattern: _bq_client created once on first call, reused forever.
-Retry: tenacity exponential backoff — 4 attempts, 4←60s wait.
+Retry: tenacity exponential backoff — 4 attempts, 4↑60s wait.
 
 table_fqn parameter controls which BQ table is queried:
   settings.BQ_FQN_ARCHIVE  (upxtx_ar) — full history → backfill
@@ -25,10 +25,19 @@ a future UTC migration fail loudly at the seam rather than silently
 corrupting the watermark advance logic.
 
 Processor strips tz-info without conversion — see processor._strip_tz().
+
+P2-9: singleton thread-safety
+------------------------------
+get_bq_client() acquires _bq_client_lock before the None check (classic
+double-checked locking).  This prevents a TOCTOU race when two startup
+tasks (run_backfill + run_gap_fill) are dispatched concurrently via
+asyncio.to_thread().  The lock is only contended at first call; all
+subsequent calls take a zero-overhead fast path (check before acquiring).
 """
 from __future__ import annotations
 
 import re
+import threading
 
 import pandas as pd
 from loguru import logger
@@ -41,7 +50,8 @@ from tenacity import (
 
 from optdash.config import settings
 
-_bq_client = None   # module-level singleton; initialised on first get_bq_client() call
+_bq_client      = None              # module-level singleton
+_bq_client_lock = threading.Lock()  # P2-9: guards singleton initialisation
 
 # P1-3: BQ record_time is UTC-labelled but numerically IST.
 # Watermark strings are naive IST wall-clock.  Both sides are IST-numeric,
@@ -78,21 +88,36 @@ def _assert_watermark_format(watermark: str) -> None:
 
 
 def get_bq_client():
-    """Return singleton BQ client, creating it on first call."""
-    global _bq_client
-    if _bq_client is None:
-        from google.oauth2 import service_account
-        from google.cloud import bigquery
+    """Return singleton BQ client, creating it on first call.
 
-        creds = service_account.Credentials.from_service_account_file(
-            str(settings.BQ_CREDENTIALS_PATH),
-            scopes=["https://www.googleapis.com/auth/bigquery.readonly"],
-        )
-        _bq_client = bigquery.Client(
-            project=settings.BQ_PROJECT,
-            credentials=creds,
-        )
-        logger.info("BQ client initialised (project={})", settings.BQ_PROJECT)
+    P2-9: double-checked locking pattern.
+    Fast path (after initialisation): read _bq_client without acquiring
+    the lock -- avoids lock contention on every BQ call.
+    Slow path (first call only): acquire _bq_client_lock, re-check, build.
+    The GIL makes the fast-path read atomic; the lock serialises the
+    slow path so only one thread ever enters the credential-loading block.
+    """
+    global _bq_client
+    # Fast path: already initialised -- no lock needed.
+    if _bq_client is not None:
+        return _bq_client
+    # Slow path: first call (or concurrent first calls at startup).
+    with _bq_client_lock:
+        # Re-check inside the lock: a thread that waited here while another
+        # thread built the client must not build a second one.
+        if _bq_client is None:
+            from google.oauth2 import service_account
+            from google.cloud import bigquery
+
+            creds = service_account.Credentials.from_service_account_file(
+                str(settings.BQ_CREDENTIALS_PATH),
+                scopes=["https://www.googleapis.com/auth/bigquery.readonly"],
+            )
+            _bq_client = bigquery.Client(
+                project=settings.BQ_PROJECT,
+                credentials=creds,
+            )
+            logger.info("BQ client initialised (project={})", settings.BQ_PROJECT)
     return _bq_client
 
 
