@@ -1,7 +1,7 @@
 """APScheduler -- drives recommendation generation and position tracking.
 
 Tick structure (every SCHEDULER_INTERVAL_SECONDS, market hours only):
-  0. Live BQ incremental pull (Step 0 -- NEW)
+  0. Live BQ incremental pull (Step 0)
                                   -> pull new snaps from upxtx since watermark
   1. Expire stale pending recommendations  -> once per tick (all underlyings)
   2. Pre-compute gate cache for open trades -> once per tick (all open positions)
@@ -42,6 +42,16 @@ calls refresh_views() immediately when a new trade_date= partition
 directory is created (first tick of a new trading day).  Previously
 duck_conn=None caused the new partition to be invisible to DuckDB
 until the EOD refresh_views() call at 15:25 -- a full-day blackout.
+
+P2-7: EOD done_flags always set
+---------------------------------
+eod_force_close() and finalize_all_shadows() both `raise` on failure.
+Previously a raise propagated to the outer tick() except, which logged
+it but did NOT set done_flags[trade_date].  The next tick re-entered the
+EOD block -- wasteful and noisy.  Fix: wrap both in individual try/except
+and set done_flags[trade_date] = True unconditionally before return.
+Both functions are idempotent so re-running on a partial-failure day at
+next startup is safe (they filter ACCEPTED / is_closed=0 rows only).
 """
 import asyncio
 import sqlite3
@@ -229,8 +239,41 @@ def create_scheduler(
             # -- EOD sweep (once per calendar day) ----------------------------
             if _is_eod() and not _eod_done_today(done_flags):
                 logger.info("Running EOD sweep for {}", trade_date)
-                eod_force_close(duck, jconn, trade_date)
-                finalize_all_shadows(duck, jconn, trade_date)
+
+                # P2-7: wrap each EOD step in its own try/except.
+                # done_flags[trade_date] is set UNCONDITIONALLY below so a
+                # failure in either step does not cause the EOD block to
+                # re-enter on subsequent ticks.  Both functions are idempotent
+                # (filter ACCEPTED / is_closed=0 rows), so any unclosed
+                # positions will be swept by the next startup's gap fill.
+                eod_ok = True
+
+                try:
+                    eod_force_close(duck, jconn, trade_date)
+                except Exception as eod_err:
+                    eod_ok = False
+                    logger.error(
+                        "EOD force-close FAILED for {} -- open positions may remain. "
+                        "Check journal on next startup.",
+                        trade_date, exc_info=True,
+                    )
+
+                try:
+                    finalize_all_shadows(duck, jconn, trade_date)
+                except Exception as shadow_err:
+                    eod_ok = False
+                    logger.error(
+                        "EOD finalize_shadows FAILED for {} -- shadows may remain open. "
+                        "Will retry on next EOD run via get_all_unclosed_shadows().",
+                        trade_date, exc_info=True,
+                    )
+
+                if not eod_ok:
+                    logger.warning(
+                        "EOD sweep for {} completed with errors -- done_flags set to "
+                        "prevent re-entry. Manual review recommended.",
+                        trade_date,
+                    )
 
                 # Purge stale raw Parquets (once per day at EOD).
                 try:
@@ -254,6 +297,10 @@ def create_scheduler(
                     oldest = sorted(done_flags)[0]
                     del done_flags[oldest]
 
+                # P2-7: set UNCONDITIONALLY -- even if eod_force_close or
+                # finalize_all_shadows raised.  Prevents re-entry on subsequent
+                # ticks.  Any cleanup is handled at next startup by idempotent
+                # get_open_trades / get_all_unclosed_shadows filters.
                 done_flags[trade_date] = True
                 return  # skip normal tick on the EOD sweep tick itself
 
