@@ -32,7 +32,7 @@ def eod_force_close(
     open_trades = trades.get_open_trades(jconn)
     snap_time   = settings.EOD_FORCE_CLOSE_TIME
 
-    # ── Read phase: pre-fetch all LTPs before any writes ───────────────────────
+    # ── Read phase: pre-fetch all LTPs before any writes ──────────────────────
     # A DuckDB error mid-loop cannot interleave with half-written journal rows
     # if we fetch everything first and write in a separate, guarded phase.
     close_payloads: list[tuple[dict, dict]] = []
@@ -123,8 +123,19 @@ def finalize_all_shadows(
 
     Each shadow uses its own s["trade_date"] for the DuckDB lookup so
     historical data for prior trading days is correctly referenced.
+
+    P1-3: read phase (DuckDB LTP fetches) is now separated from the write
+    phase (journal updates).  All close_shadow() calls use commit=False and
+    a single jconn.commit() at the end makes every shadow close atomic.
+    On any exception, jconn.rollback() leaves all shadows open so the next
+    EOD run retries the full sweep cleanly (no partial-close state).
     """
     shadows = shadow.get_all_unclosed_shadows(jconn)
+    if not shadows:
+        return
+
+    # ── Read phase: pre-fetch all LTPs before any writes ──────────────────────
+    close_payloads: list[tuple[dict, dict]] = []
     for s in shadows:
         shadow_date = s["trade_date"]   # use shadow's own date, not today
         current = _fetch_strike_current(
@@ -140,12 +151,33 @@ def finalize_all_shadows(
 
         pnl     = round((ltp - s["entry_premium"]) / s["entry_premium"] * 100, 2)
         outcome = _classify_shadow_outcome(pnl)
-        shadow.close_shadow(jconn, s["id"], {
+        close_payloads.append((s, {
             "final_pnl_pct": pnl,
             "outcome":       outcome,
             "closed_snap":   settings.EOD_FORCE_CLOSE_TIME,
-        })
-        logger.debug(
-            "EOD shadow close: id={} date={} outcome={} pnl={:+.1f}%",
-            s["id"], shadow_date, outcome, pnl
+        }))
+
+    # ── Write phase: single atomic transaction ─────────────────────────────
+    # P1-3: commit=False on every close_shadow() call; single commit at end.
+    # rollback() on any exception leaves all shadows open for a clean retry.
+    try:
+        for s, payload in close_payloads:
+            shadow.close_shadow(jconn, s["id"], payload, commit=False)
+            logger.debug(
+                "EOD shadow close: id={} date={} outcome={} pnl={:+.1f}%",
+                s["id"], s["trade_date"], payload["outcome"], payload["final_pnl_pct"]
+            )
+        jconn.commit()
+        logger.info(
+            "EOD finalize_all_shadows: {} shadow(s) closed atomically.",
+            len(close_payloads),
         )
+    except Exception:
+        jconn.rollback()
+        logger.error(
+            "finalize_all_shadows rolled back -- {} shadow(s) remain open. "
+            "Will retry on next EOD run.",
+            len(shadows),
+            exc_info=True,
+        )
+        raise
