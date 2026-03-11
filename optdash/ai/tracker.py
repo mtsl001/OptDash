@@ -46,11 +46,15 @@ def track_open_positions(
         theta = current["theta"]
         vega  = current["vega"]
 
-        # Use actual_entry_price (slippage-adjusted fill) if the trader
-        # recorded one on ACCEPT. Falls back to recommended entry_premium.
-        # This matches eod.py and ensures all PnL/trailing-stop math is
-        # based on what the trader actually paid, not what was recommended.
-        entry = trade["actual_entry_price"] or trade["entry_premium"]
+        # P0-1 fix: explicit None check so actual_entry_price=0.0 (data
+        # corruption / test trade) is not silently promoted to entry_premium
+        # via the `or` falsy coercion.  Mirrors the identical fix already
+        # applied in eod.py (Fix EOD-2) and api/routers/ai.py (Fix API-2).
+        # All PnL, SL, trailing-stop, and attribution calculations downstream
+        # use this value — a wrong entry here corrupts every metric for the
+        # lifetime of the position.
+        _actual = trade["actual_entry_price"]
+        entry   = _actual if _actual is not None else trade["entry_premium"]
         lot   = settings.LOT_SIZES.get(underlying, 1)
         # Fix-K (F-01): pnl_abs is monetary (point_diff * lot); pnl_pct stays per-unit %
         pnl_abs = round((ltp - entry) * lot, 2)
@@ -206,14 +210,44 @@ def expire_stale_recommendations(
     trade_date: str,
     snap_time:  str,
 ) -> None:
-    """Mark GENERATED trades as EXPIRED after AI_EXPIRY_MAX_SNAPS unactioned."""
+    """Mark GENERATED trades as EXPIRED after AI_EXPIRY_MAX_SNAPS unactioned.
+
+    P0-2 fix: prior-session recommendations are expired immediately on the
+    first tick of a new trading day, before the intraday age check runs.
+
+    Root cause: _snaps_since() uses max(0, ...) internally, so a stale
+    recommendation from 15:25 yesterday produces age=0 at 09:15 today --
+    never >= AI_EXPIRY_MAX_SNAPS (e.g. 3).  The recommendation then blocks
+    generate_recommendation() for the entire new session (get_pending_trades
+    returns it via max_age_days=1) until EOD sweep at 15:25.
+
+    Fix: any GENERATED trade whose trade_date is strictly earlier than
+    today's trade_date is an orphan from a prior session and is expired
+    immediately with a distinct state_reason so it is visible in the log
+    and learning report without polluting intraday expiry metrics.
+    """
     pending = trades.get_pending_trades(jconn)
     for trade in pending:
+        # P0-2: expire prior-session orphans immediately -- do not attempt
+        # intraday age arithmetic across a session boundary.
+        if trade["trade_date"] < trade_date:
+            trades.update_status(
+                jconn, trade["id"], TradeStatus.EXPIRED.value,
+                state_reason="Stale recommendation from prior session -- expired on new day open",
+            )
+            logger.info(
+                "P0-2: expired prior-session recommendation id={} "
+                "underlying={} trade_date={} (current session: {})",
+                trade["id"], trade["underlying"], trade["trade_date"], trade_date,
+            )
+            continue
+        # Same-session intraday expiry: age out unactioned recommendations
+        # after AI_EXPIRY_MAX_SNAPS × 5-minute ticks.
         age = _snaps_since(trade["snap_time"], snap_time)
         if age >= settings.AI_EXPIRY_MAX_SNAPS:
             trades.update_status(
                 jconn, trade["id"], TradeStatus.EXPIRED.value,
-                state_reason="Not actioned within expiry window"
+                state_reason="Not actioned within expiry window",
             )
 
 
