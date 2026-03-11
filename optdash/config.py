@@ -1,5 +1,6 @@
 """Central settings - all tuneable constants in one place."""
 import re
+from datetime import date
 from pathlib import Path
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -165,6 +166,25 @@ class Settings(BaseSettings):
     BACKFILL_START_DATE: str  = "2026-02-17"
     BACKFILL_END_DATE:   str  = ""
     ENABLE_BACKFILL:     bool = True
+
+    # P1-4: validate BACKFILL_START_DATE as a strict ISO date (YYYY-MM-DD) at
+    # Settings construction time.  Without this, a bad format (e.g. "17-02-2026"
+    # from a misconfigured .env) passes pydantic silently, lets the process
+    # start and serve API requests, then crashes the pipeline on the first
+    # scheduler tick when watermark._initial_watermark() calls
+    # date.fromisoformat() -- leaving the app in a dead-pipeline state.
+    # Fail-fast: ValidationError is raised before uvicorn finishes startup.
+    @field_validator("BACKFILL_START_DATE")
+    @classmethod
+    def _check_backfill_start_date(cls, v: str) -> str:
+        try:
+            date.fromisoformat(v)
+        except ValueError:
+            raise ValueError(
+                f"BACKFILL_START_DATE={v!r} is not a valid ISO date. "
+                "Expected format: YYYY-MM-DD (e.g. '2026-02-17')."
+            )
+        return v
 
     # BQ columns fetched in every pull. processor.py maps these to PARQUET_SCHEMA.
     #
