@@ -1,16 +1,34 @@
 """bq_client.py — BigQuery auth + pull functions with retry.
 
 Singleton pattern: _bq_client created once on first call, reused forever.
-Retry: tenacity exponential backoff — 4 attempts, 4→60s wait.
+Retry: tenacity exponential backoff — 4 attempts, 4←60s wait.
 
 table_fqn parameter controls which BQ table is queried:
   settings.BQ_FQN_ARCHIVE  (upxtx_ar) — full history → backfill
   settings.BQ_FQN_LIVE     (upxtx)    — rolling live  → gap fill + incremental
 
-record_time in BQ is UTC-labelled but numerically IST.
+P1-3: IST/UTC seam
+------------------
+record_time in BQ is UTC-labelled but numerically IST (i.e. a 09:30 IST
+trade is stored as 09:30 UTC, not 04:00 UTC).  Watermark strings are
+stored as naive IST wall-clock values by watermark.py.
+
+These two IST-numeric values cancel in TIMESTAMP('{watermark}') comparisons
+today.  The risk is at re-ingestion: if BQ record_time is ever corrected to
+true UTC, pull_incremental would silently skip 5h30m of data per tick (or
+re-pull 5h30m of duplicates) with no error or log entry.
+
+_assert_watermark_format() is called in pull_incremental as a tripwire:
+it raises ValueError immediately if the watermark is tz-aware ('+05:30'
+suffix) or otherwise not a bare 'YYYY-MM-DD HH:MM:SS' string.  This makes
+a future UTC migration fail loudly at the seam rather than silently
+corrupting the watermark advance logic.
+
 Processor strips tz-info without conversion — see processor._strip_tz().
 """
 from __future__ import annotations
+
+import re
 
 import pandas as pd
 from loguru import logger
@@ -24,6 +42,39 @@ from tenacity import (
 from optdash.config import settings
 
 _bq_client = None   # module-level singleton; initialised on first get_bq_client() call
+
+# P1-3: BQ record_time is UTC-labelled but numerically IST.
+# Watermark strings are naive IST wall-clock.  Both sides are IST-numeric,
+# which makes the TIMESTAMP() comparison correct TODAY but fragile if BQ
+# is ever re-ingested with true UTC values.  This constant makes the
+# assumption explicit and grep-able; _assert_watermark_format() is the
+# runtime tripwire that catches a misrouted tz-aware or UTC-corrected string.
+_IST_AS_UTC_OFFSET_WARNING = (
+    "BQ record_time is UTC-labelled / IST-numeric. "
+    "Watermark is naive IST. Both sides cancel in TIMESTAMP() today. "
+    "If BQ is corrected to true UTC, update watermark.py and this module together."
+)
+
+# Bare naive datetime pattern -- no tz suffix, no 'T' separator.
+_NAIVE_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+
+def _assert_watermark_format(watermark: str) -> None:
+    """Raise ValueError if watermark is not a bare 'YYYY-MM-DD HH:MM:SS' string.
+
+    This is a tripwire for the IST/UTC seam (P1-3).  All current callers
+    (watermark.py) produce the correct format; this guard catches:
+      - A tz-aware string accidentally passed in ('+05:30' or 'Z' suffix).
+      - A UTC-corrected value that would silently shift the watermark by 5h30m.
+    Fires loudly at the data-ingestion seam rather than silently
+    corrupting incremental pulls.
+    """
+    if not _NAIVE_DATETIME_RE.fullmatch(watermark):
+        raise ValueError(
+            f"P1-3 watermark format violation: expected bare 'YYYY-MM-DD HH:MM:SS', "
+            f"got {watermark!r}.  "
+            f"Hint: {_IST_AS_UTC_OFFSET_WARNING}"
+        )
 
 
 def get_bq_client():
@@ -83,7 +134,12 @@ def pull_incremental(watermark: str, table_fqn: str) -> pd.DataFrame:
 
     Used by live incremental tick (upxtx). Returns empty DataFrame if
     no new rows since last watermark (normal between feed cadence windows).
+
+    P1-3: _assert_watermark_format() raises ValueError if watermark is
+    tz-aware or otherwise not a bare 'YYYY-MM-DD HH:MM:SS' string.
+    This is the IST/UTC seam tripwire -- see module docstring.
     """
+    _assert_watermark_format(watermark)   # P1-3 tripwire
     query = (
         f"SELECT {_cols()} FROM `{table_fqn}` "
         f"WHERE record_time > TIMESTAMP('{watermark}') "
@@ -108,7 +164,11 @@ def pull_day_gap(trade_date_str: str, from_watermark: str, table_fqn: str) -> pd
     Used by gap fill (upxtx). Handles the 06:35 IST sync scenario:
     if upxtx is empty (post-sync, pre-market), returns empty DataFrame
     which gap_fill.py logs as INFO (not WARNING).
+
+    P1-3: _assert_watermark_format() guards the from_watermark string
+    at the same seam as pull_incremental.
     """
+    _assert_watermark_format(from_watermark)   # P1-3 tripwire
     query = (
         f"SELECT {_cols()} FROM `{table_fqn}` "
         f"WHERE DATE(record_time) = '{trade_date_str}' "
