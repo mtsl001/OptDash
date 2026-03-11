@@ -345,6 +345,16 @@ class Settings(BaseSettings):
     SESSION_MIDDAY_CONFIDENCE_PENALTY: int = 10
     SESSION_CLOSING_CONFIDENCE_CAP:    int = 60
 
+    # -- Pipeline Greeks Safety
+    # P0-3: cap for vanna values before VEX multiplication in processor.py.
+    # Near-zero IV rows from the NSE feed produce a near-zero denominator in
+    # the vanna approximation (δ × (1−|δ|) / (spot × σ × √T)), yielding
+    # vanna of 100–10,000+.  These corrupt VEX totals permanently in Parquet.
+    # Calibration: normal ATM vanna at 20% IV, 1-DTE ≈ 0.001; clip at 50
+    # is ~50,000× the normal range — catches all noise without ever clipping
+    # valid data.  Override via VANNA_CLIP= in .env if needed.
+    VANNA_CLIP: float = 50.0
+
     # ── Computed BQ table FQNs (read-only properties) ────────────────────────
     # Placed after all field_validators to comply with pydantic-settings
     # class layout requirements. Override BQ_PROJECT / BQ_DATASET in .env
