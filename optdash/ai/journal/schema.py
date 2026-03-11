@@ -104,6 +104,11 @@ CREATE TABLE IF NOT EXISTS shadow_trades (
     strike_price    REAL    NOT NULL,
     expiry_date     TEXT    NOT NULL,
     entry_premium   REAL    NOT NULL,
+    -- P0-5: sl_price and target_price were present in _ALLOWED_SHADOW_COLS
+    -- (shadow.py) but absent from this DDL, causing OperationalError on any
+    -- create_shadow() call that passes these keys (e.g. the rejection path).
+    sl_price        REAL,
+    target_price    REAL,
     final_pnl_pct   REAL,
     outcome         TEXT,               -- ShadowOutcome enum value
     closed_snap     TEXT,
@@ -195,6 +200,14 @@ _MIGRATIONS = [
     # Existing databases already have idx_shadow_date; this adds the is_closed
     # predicate so WHERE trade_date=? AND is_closed=0 is a single covering scan.
     "CREATE INDEX IF NOT EXISTS idx_shadow_active ON shadow_trades(trade_date, is_closed)",
+
+    # P0-5: sl_price and target_price were present in _ALLOWED_SHADOW_COLS
+    # (shadow.py) but absent from the CREATE_SHADOWS DDL and this migration
+    # list.  Any create_shadow() call passing either key raised OperationalError
+    # at the first trade rejection.  Added to CREATE_SHADOWS for fresh installs;
+    # these ALTER TABLE entries backfill existing databases.
+    "ALTER TABLE shadow_trades ADD COLUMN sl_price     REAL",
+    "ALTER TABLE shadow_trades ADD COLUMN target_price REAL",
 ]
 
 

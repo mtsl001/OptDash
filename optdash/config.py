@@ -355,6 +355,16 @@ class Settings(BaseSettings):
     # valid data.  Override via VANNA_CLIP= in .env if needed.
     VANNA_CLIP: float = 50.0
 
+    # P0-2: cap for charm values before CEX multiplication in processor.py.
+    # Same failure mode as VANNA_CLIP: near-zero IV rows produce a near-zero
+    # denominator in the charm approximation (−θ / (spot × σ × √T)), yielding
+    # charm of ±10,000–100,000 that is written permanently to Parquet and
+    # dominates all CEX SUM() totals in vex_cex.py analytics.
+    # Calibration: normal ATM charm at 20% IV, 1-DTE ≈ 0.001–0.01; clip at 50
+    # is ~5,000× the normal range — symmetric with VANNA_CLIP.
+    # Override via CHARM_CLIP= in .env if needed.
+    CHARM_CLIP: float = 50.0
+
     # ── Computed BQ table FQNs (read-only properties) ────────────────────────
     # Placed after all field_validators to comply with pydantic-settings
     # class layout requirements. Override BQ_PROJECT / BQ_DATASET in .env

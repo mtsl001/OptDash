@@ -260,6 +260,12 @@ def _compute_gex_vex_cex(df: pd.DataFrame, lot_size: int) -> pd.DataFrame:
     near-zero denominator, yielding vanna of 100–10,000+ that permanently
     corrupts VEX totals in Parquet.  See config.py VANNA_CLIP for
     calibration details.
+
+    P0-2: charm is clipped to [−CHARM_CLIP, +CHARM_CLIP] before the CEX
+    multiplication.  Same failure mode as vanna: near-zero IV rows produce
+    charm of ±10,000–100,000 that permanently corrupts CEX SUM() totals in
+    Parquet and all downstream vex_cex.py analytics.  See config.py
+    CHARM_CLIP for calibration details.
     """
     df = df.copy()
     df["gex"] = np.nan
@@ -300,7 +306,13 @@ def _compute_gex_vex_cex(df: pd.DataFrame, lot_size: int) -> pd.DataFrame:
     opts["vex"]  = (opts["oi"] * lot_size * vanna * opts["spot"]) / _VEX_SCALE
 
     # CEX
+    # P0-2: clip charm before multiplying into CEX.  Near-zero IV rows produce
+    # charm = -theta / denom where denom ≈ 0, yielding ±10,000–100,000.
+    # These corrupt CEX SUM() totals permanently in Parquet.  Clipping to
+    # [-CHARM_CLIP, +CHARM_CLIP] (default ±50) is symmetric with VANNA_CLIP
+    # and safe: normal ATM charm is 0.001–0.01 (~5,000× below the clip).
     charm        = -opts["theta"] / denom
+    charm        = charm.clip(-settings.CHARM_CLIP, settings.CHARM_CLIP)  # P0-2
     opts["cex"]  = (opts["oi"] * lot_size * charm) / _CEX_SCALE
 
     df.loc[mask, ["gex", "vex", "cex"]] = opts[["gex", "vex", "cex"]].values
