@@ -10,6 +10,7 @@ _ALLOWED_SHADOW_COLS: frozenset[str] = frozenset({
     "trade_id", "trade_date", "underlying", "option_type",
     "strike_price", "expiry_date", "entry_premium",
     "final_pnl_pct", "outcome", "closed_snap", "is_closed",
+    "sl_price", "target_price",
 })
 
 _ALLOWED_SHADOW_SNAP_COLS: frozenset[str] = frozenset({
@@ -101,14 +102,29 @@ def insert_shadow_snap(
         conn.commit()
 
 
-def close_shadow(conn: sqlite3.Connection, shadow_id: int, data: dict) -> None:
+def close_shadow(
+    conn:      sqlite3.Connection,
+    shadow_id: int,
+    data:      dict,
+    commit:    bool = True,
+) -> None:
+    """Update a shadow trade to is_closed=1 with final PnL and outcome.
+
+    commit=True  (default): commit immediately -- safe for standalone callers
+    such as shadow_tracker.py (intraday SL/target hit path).
+    commit=False: leave the UPDATE in the caller's open transaction so multiple
+    close_shadow() calls can be batched atomically (P1-3: used by
+    finalize_all_shadows() in eod.py to wrap all EOD shadow closes in a
+    single try/rollback block, preventing a partial-close state on failure).
+    """
     conn.execute(
         """UPDATE shadow_trades
            SET is_closed=1, final_pnl_pct=?, outcome=?, closed_snap=?
            WHERE id=?""",
         [data["final_pnl_pct"], data["outcome"], data["closed_snap"], shadow_id]
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def get_shadow_history(
