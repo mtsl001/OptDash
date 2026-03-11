@@ -34,6 +34,14 @@ This allows HTTP request handlers and WS message dispatch to run
 between analytics phases without blocking for the full tick duration.
 All DuckDB calls remain on the same thread -- the shared in-process
 :memory: connection is not safe for concurrent multi-thread access.
+
+P1-P2-8: first-day partition refresh
+--------------------------------------
+Step 0 passes get_conn() to run_incremental_pull() so processor.py
+calls refresh_views() immediately when a new trade_date= partition
+directory is created (first tick of a new trading day).  Previously
+duck_conn=None caused the new partition to be invisible to DuckDB
+until the EOD refresh_views() call at 15:25 -- a full-day blackout.
 """
 import asyncio
 import sqlite3
@@ -97,6 +105,10 @@ def _is_market_hours() -> bool:
 
 
 def _is_eod() -> bool:
+    # P2-6: correctness depends on EOD_SWEEP_TIME being zero-padded HH:MM,
+    # which is enforced by the _check_hhmm validator in config.py.
+    # _snap_time_str() always produces zero-padded output (f"{h:02d}:{m:02d}").
+    # Both sides are zero-padded HH:MM, so lexicographic >= is correct.
     return _snap_time_str() >= settings.EOD_SWEEP_TIME
 
 
@@ -196,9 +208,18 @@ def create_scheduler(
             # does not prevent the tick from running on non-BQ deployments.
             # Non-fatal: exception logged, tick continues with last available
             # data so recommendations and gate scores are not blocked.
+            #
+            # P1-P2-8: pass duck (LockedConn) to run_incremental_pull so that
+            # processor._write_trade_date() calls refresh_views() immediately
+            # when the first tick of a new trading day creates a new partition
+            # directory.  Previously duck_conn=None meant the new day's
+            # Parquet was invisible to DuckDB until the EOD refresh at 15:25
+            # -- a full-day analytics blackout.
             try:
                 from optdash.pipeline.incremental import run_incremental_pull
-                new_data = await asyncio.to_thread(run_incremental_pull)
+                new_data = await asyncio.to_thread(
+                    run_incremental_pull, duck_conn=duck
+                )
                 if new_data:
                     logger.debug("[{}] Incremental BQ snap ingested.", snap_time)
             except Exception as inc_err:
@@ -226,7 +247,7 @@ def create_scheduler(
                     refresh_views(duck)
                     logger.info("DuckDB view refreshed for next trading day.")
                 except Exception as rv_err:
-                    logger.error("refresh_views failed: {}", rv_err)
+                    logger.error("refresh_views failed: {}", rv_err, exc_info=True)
 
                 # Trim done_flags to last 7 entries to prevent unbounded growth.
                 if len(done_flags) > 7:
@@ -300,7 +321,7 @@ def create_scheduler(
             # No yield needed -- end of tick.
 
         except Exception as e:
-            logger.error("Scheduler tick error @ {}: {}", snap_time, e)
+            logger.error("Scheduler tick error @ {}: {}", snap_time, e, exc_info=True)
 
     scheduler = AsyncIOScheduler(timezone=IST)
     scheduler.add_job(
