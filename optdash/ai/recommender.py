@@ -35,11 +35,17 @@ def generate_recommendation(
     """
     Called every scheduler tick for each underlying.
     Returns the generated trade card dict, or None if no recommendation issued.
+
+    Analytics isolation policy (P2-E):
+      A failed analytics call BLOCKS the recommendation for this tick.
+      Rationale: every analytics result feeds either the confidence score
+      or a pre-flight hard rule.  Letting a recommendation through with a
+      degraded empty-dict default would produce an artificially low/wrong
+      confidence or gate score -- a silent bad recommendation is worse than
+      no recommendation.  Each call is wrapped individually so the failure
+      reason is logged with full context and the next tick retries cleanly.
     """
     # Guard: open position exists -- never recommend while in trade.
-    # This guarantee means existing_open_trades is always 0 by the time
-    # run_pre_flight() is called, so Rule 6 in pre_flight was dead code
-    # and has been removed. See pre_flight.py for details.
     open_trades = trades.get_open_trades(jconn, underlying=underlying)
     if open_trades:
         return None
@@ -60,32 +66,70 @@ def generate_recommendation(
     # -- Step 2: Gate -- direction-aware so C9 (VEX, 2 pts) scores correctly
     gate = get_environment_score(conn, trade_date, snap_time, underlying, direction=direction)
 
-    # -- Step 3: Supporting analytics
-    iv_data  = get_ivr_ivp(conn, trade_date, snap_time, underlying)
-    gex_data = get_net_gex(conn, trade_date, snap_time, underlying)
+    # -- Step 3: Supporting analytics (P2-E: each call isolated)
+    # iv_data
+    try:
+        iv_data = get_ivr_ivp(conn, trade_date, snap_time, underlying)
+    except Exception:
+        logger.warning(
+            "P2-E: get_ivr_ivp failed for {} {} {} -- skipping tick",
+            underlying, trade_date, snap_time, exc_info=True,
+        )
+        return None
 
-    # P4-F2: Fix-G already avoids a second get_vex_cex_current() round-trip by
-    # reading dir_res["vex_data"] directly. The previous `or` pattern fired the
-    # second call whenever vex_data was an empty dict {} (falsy but valid).
-    # Key-presence check ensures {} is accepted as-is; second call only fires
-    # when direction.py hit an exception before computing vex (key absent).
-    vex_data = (
-        dir_res["vex_data"] if "vex_data" in dir_res
-        else get_vex_cex_current(conn, trade_date, snap_time, underlying)
-    )
+    # gex_data
+    try:
+        gex_data = get_net_gex(conn, trade_date, snap_time, underlying)
+    except Exception:
+        logger.warning(
+            "P2-E: get_net_gex failed for {} {} {} -- skipping tick",
+            underlying, trade_date, snap_time, exc_info=True,
+        )
+        return None
+
+    # vex_data -- P4-F2: prefer dir_res["vex_data"] to avoid a second DuckDB
+    # round-trip; fallback to get_vex_cex_current() only when key is absent
+    # (direction.py exception path). {} is a valid result (no VEX signal).
+    try:
+        vex_data = (
+            dir_res["vex_data"] if "vex_data" in dir_res
+            else get_vex_cex_current(conn, trade_date, snap_time, underlying)
+        )
+    except Exception:
+        logger.warning(
+            "P2-E: vex_data resolution failed for {} {} {} -- skipping tick",
+            underlying, trade_date, snap_time, exc_info=True,
+        )
+        return None
 
     dealer_oc = vex_data.get("dealer_oclock", False)
 
-    nearest_expiry = _nearest_expiry(conn, trade_date, snap_time, underlying)
-    max_pain = (
-        get_max_pain(conn, trade_date, snap_time, underlying, expiry_date=nearest_expiry)
-        if nearest_expiry else {}
-    )
+    # max_pain (optional metric -- None nearest_expiry is normal on non-TIER1 days)
+    try:
+        nearest_expiry = _nearest_expiry(conn, trade_date, snap_time, underlying)
+        max_pain = (
+            get_max_pain(conn, trade_date, snap_time, underlying, expiry_date=nearest_expiry)
+            if nearest_expiry else {}
+        )
+    except Exception:
+        logger.warning(
+            "P2-E: get_max_pain failed for {} {} {} -- skipping tick",
+            underlying, trade_date, snap_time, exc_info=True,
+        )
+        return None
 
     # -- Best strike selection
-    strike_list = get_strikes(
-        conn, trade_date, snap_time, underlying, top_n=settings.SCREENER_TOP_N
-    )
+    try:
+        strike_list = get_strikes(
+            conn, trade_date, snap_time, underlying, top_n=settings.SCREENER_TOP_N
+        )
+    except Exception:
+        logger.warning(
+            "P2-E: get_strikes failed for {} {} {} -- skipping tick",
+            underlying, trade_date, snap_time, exc_info=True,
+        )
+        return None
+
     candidates = [s for s in strike_list if s["option_type"] == direction]
     if not candidates:
         return None
@@ -106,22 +150,26 @@ def generate_recommendation(
     )
 
     # -- Confidence score
-    conf_result = compute_confidence(
-        gate_score=gate["score"],
-        direction_result=dir_res,
-        iv_data=iv_data,
-        gex_data=gex_data,
-        vex_data=vex_data,
-        strike=strike,
-        learning_stats=learning,
-        session=session,
-    )
+    try:
+        conf_result = compute_confidence(
+            gate_score=gate["score"],
+            direction_result=dir_res,
+            iv_data=iv_data,
+            gex_data=gex_data,
+            vex_data=vex_data,
+            strike=strike,
+            learning_stats=learning,
+            session=session,
+        )
+    except Exception:
+        logger.warning(
+            "P2-E: compute_confidence failed for {} {} {} -- skipping tick",
+            underlying, trade_date, snap_time, exc_info=True,
+        )
+        return None
     confidence = conf_result["confidence"]
 
     # -- Pre-flight hard rules
-    # existing_open_trades is not passed: the guard above (lines ~38-40)
-    # guarantees open_trades is empty before this point. Rule 6 has been
-    # removed from pre_flight.py to reflect this invariant.
     passed, failures = run_pre_flight(
         gate_score=gate["score"],
         confidence=confidence,
@@ -157,34 +205,47 @@ def generate_recommendation(
     )
 
     # -- Write to journal
-    trade_id = trades.create_trade(jconn, {
-        "trade_date":        trade_date,
-        "snap_time":         snap_time,
-        "underlying":        underlying,
-        "option_type":       direction,
-        "strike_price":      strike["strike_price"],
-        "expiry_date":       strike["expiry_date"],
-        "entry_premium":     entry_premium,
-        "sl_price":          sl,
-        "target_price":      target,
-        "confidence":        confidence,
-        "gate_score":        gate["score"],
-        "gate_verdict":      gate["verdict"],
-        "s_score":           strike["s_score"],
-        "quality_grade":     quality["grade"],
-        "direction_signals": json.dumps(dir_res["signals"]),
-        "narrative":         narrative,
-        "status":            TradeStatus.GENERATED.value,
-        "session":           session.value,
-        "delta":             strike.get("delta"),
-        "theta":             strike.get("theta"),
-        "vega":              strike.get("vega"),
-        "gamma":             strike.get("gamma"),
-        "iv_at_entry":       strike.get("iv"),
-        "spot_at_entry":     gex_data.get("spot"),
-        "dte":               strike.get("dte"),
-        "conf_buckets":      json.dumps(conf_result["buckets"]),
-    })
+    # P2-A: wrap create_trade() so a DB error (disk full, schema mismatch,
+    # constraint violation) does not propagate to the scheduler tick handler
+    # and leave both guards (open_trades, pending_trades) clear -- which would
+    # cause generate_recommendation() to re-enter and attempt a duplicate
+    # recommendation on the very next tick.  Return None cleanly; the next
+    # tick retries from scratch.
+    try:
+        trade_id = trades.create_trade(jconn, {
+            "trade_date":        trade_date,
+            "snap_time":         snap_time,
+            "underlying":        underlying,
+            "option_type":       direction,
+            "strike_price":      strike["strike_price"],
+            "expiry_date":       strike["expiry_date"],
+            "entry_premium":     entry_premium,
+            "sl_price":          sl,
+            "target_price":      target,
+            "confidence":        confidence,
+            "gate_score":        gate["score"],
+            "gate_verdict":      gate["verdict"],
+            "s_score":           strike["s_score"],
+            "quality_grade":     quality["grade"],
+            "direction_signals": json.dumps(dir_res["signals"]),
+            "narrative":         narrative,
+            "status":            TradeStatus.GENERATED.value,
+            "session":           session.value,
+            "delta":             strike.get("delta"),
+            "theta":             strike.get("theta"),
+            "vega":              strike.get("vega"),
+            "gamma":             strike.get("gamma"),
+            "iv_at_entry":       strike.get("iv"),
+            "spot_at_entry":     gex_data.get("spot"),
+            "dte":               strike.get("dte"),
+            "conf_buckets":      json.dumps(conf_result["buckets"]),
+        })
+    except Exception:
+        logger.error(
+            "P2-A: create_trade() failed for {} {} {} -- recommendation not written",
+            underlying, trade_date, snap_time, exc_info=True,
+        )
+        return None
 
     logger.info(
         "Recommendation: {} {} {} @ {:.1f} | conf={}% gate={} session={}",
