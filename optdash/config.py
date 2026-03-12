@@ -144,6 +144,17 @@ class Settings(BaseSettings):
     # 5 = full Mon-Fri week; increase for longer historical analytics.
     DUCK_VIEW_LOOKBACK_DAYS: int = 5
 
+    # P2-14: FileLock timeout for the Parquet read-merge-write cycle in
+    # writer.py.  If the lock cannot be acquired within this many seconds a
+    # Timeout exception is raised, letting the scheduler log and skip the
+    # tick rather than stacking up writers indefinitely.
+    #
+    # Default 30 preserves the previous hardcoded value.
+    # Tune per deployment:
+    #   WRITER_LOCK_TIMEOUT_SECONDS=60   # slow disk / NFS mount / large files
+    #   WRITER_LOCK_TIMEOUT_SECONDS=10   # small VPS — fail fast
+    WRITER_LOCK_TIMEOUT_SECONDS: int = 30
+
     # P2-3: DuckDB engine settings — moved from hardcoded PRAGMAs in
     # duckdb_gateway.startup() to config so they can be tuned per deployment
     # via .env without a code change.
