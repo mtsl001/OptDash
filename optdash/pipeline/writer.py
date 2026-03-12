@@ -63,6 +63,12 @@ Column notes
 - s_score: REMOVED. Computed live by screener.py -- must never be stored
   in Parquet (per-snap value would be stale immediately after write).
 - rho: NOT ADDED. Not provided by Upstox API / BQ feed.
+
+P2-14: FileLock timeout
+-----------------------
+The advisory lock timeout is read from settings.WRITER_LOCK_TIMEOUT_SECONDS
+(default 30 s, same as the previous hardcoded value) so it can be tuned
+per deployment in .env without a code change.
 """
 from __future__ import annotations
 
@@ -73,6 +79,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from filelock import FileLock
 from loguru import logger
+
+from optdash.config import settings
 
 PROCESSED_SUBDIR   = "processed"
 _PARTITION_PREFIX  = "trade_date="
@@ -152,10 +160,11 @@ def write_snap(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Advisory lock: serialises concurrent read-merge-write on the same file.
-    # Timeout=30 s: if another writer holds the lock for >30 s something is
-    # badly wrong; let the exception propagate rather than stacking up writers.
+    # P2-14: timeout read from settings so it can be tuned per deployment
+    # without a code change.  Default 30 s preserves the previous behaviour.
+    # Raise on timeout rather than stacking up writers behind the lock.
     lock_path = path.with_suffix(".lock")
-    with FileLock(str(lock_path), timeout=30):
+    with FileLock(str(lock_path), timeout=settings.WRITER_LOCK_TIMEOUT_SECONDS):
         _write_snap_locked(path, snap_df, trade_date, underlying)
 
 
