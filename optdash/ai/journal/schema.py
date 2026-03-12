@@ -3,9 +3,18 @@
 All tables use CREATE TABLE IF NOT EXISTS so init_db() is safely idempotent
 and can be called on every fresh connection without side effects.
 
-For existing databases, _run_migrations() uses ALTER TABLE to add new columns;
-SQLite raises OperationalError("duplicate column name") on re-runs, which is
-caught and silenced. All other errors propagate so startup fails loudly.
+For existing databases, _run_migrations() uses ALTER TABLE to add new columns
+and CREATE INDEX IF NOT EXISTS to add new indexes.
+
+SQLite OperationalError handling in _run_migrations():
+  - "duplicate column name": ALTER TABLE re-run on a column that already
+    exists -- silent pass (idempotent).
+  - "already exists": CREATE INDEX re-run on older SQLite builds that do
+    not honour IF NOT EXISTS -- silent pass (idempotent).
+  - "no such table": a table was not created (e.g. OOM mid-executescript);
+    RuntimeError with a targeted diagnostic message.
+  - anything else: RuntimeError with the raw SQL + error so startup fails
+    loudly (disk full, locked, wrong column type, etc.).
 
 Connection entry-point
 ----------------------
@@ -164,6 +173,13 @@ CREATE INDEX IF NOT EXISTS idx_shadow_snaps_shadow_id ON shadow_snaps(shadow_id)
 # 2. Add a corresponding ALTER TABLE line here (for existing databases).
 # 3. Never remove or reorder existing entries -- they are idempotent no-ops
 #    on databases that already have the column.
+#
+# RULES FOR ADDING NEW INDEXES
+# ----------------------------
+# 1. Add the CREATE INDEX IF NOT EXISTS to CREATE_INDEXES above.
+# 2. Add the same CREATE INDEX IF NOT EXISTS here for existing databases.
+# 3. _run_migrations() silences "already exists" for CREATE INDEX re-runs
+#    on older SQLite builds that do not honour IF NOT EXISTS.
 # ---------------------------------------------------------------------------
 _MIGRATIONS = [
     # -- original column -------------------------------------------------------
@@ -257,28 +273,56 @@ def init_db(conn) -> None:
 
 
 def _run_migrations(conn) -> None:
-    """Apply ALTER TABLE migrations for existing databases.
+    """Apply ALTER TABLE and CREATE INDEX migrations for existing databases.
 
-    Each migration is attempted once. Only OperationalError("duplicate column
-    name") is silenced -- this is the expected benign result when the column
-    already exists on a re-run, making every entry idempotent.
+    Each migration is attempted once.  Three OperationalError subtypes are
+    handled explicitly:
 
-    Fix-P1-13: all other OperationalError subtypes (table locked, disk full,
-    wrong column type, etc.) previously fell through the bare `except Exception:
-    pass` and were silently swallowed. The column then simply did not exist;
-    the first INSERT/SELECT against it raised a cryptic runtime
-    OperationalError with no trace back to the failed migration.
-    Now they raise RuntimeError at startup so the failure is loud and
-    immediately traceable to the offending migration statement.
+    1. "duplicate column name"  -- ALTER TABLE re-run on an existing column.
+       Silent pass: idempotent, expected on every upgrade after the column
+       was first added.
+
+    2. "already exists"         -- CREATE INDEX re-run on older SQLite builds
+       (< 3.3.0) that do not honour IF NOT EXISTS on indexes.
+       Silent pass: idempotent, index is already present.
+
+    3. "no such table"          -- CREATE INDEX failed because the target
+       table was never created (e.g. OOM or disk-full mid-executescript in
+       init_db()).  RuntimeError with a targeted diagnostic directing the
+       operator to check whether init_db() completed successfully.
+
+    4. anything else            -- RuntimeError wrapping the raw SQL + error
+       so startup fails loudly (disk full, locked, wrong column type, etc.).
+       The column / index does not exist; the first query against it will
+       raise a cryptic error with no trace back to the failed migration
+       unless we surface it here.
+
+    Fix-P1-13: previously all non-duplicate OperationalErrors were silently
+    swallowed via bare `except Exception: pass`, hiding disk-full / locked /
+    wrong-type failures at startup.
     """
     for sql in _MIGRATIONS:
         try:
             conn.execute(sql)
             conn.commit()
         except sqlite3.OperationalError as e:
-            if "duplicate column name" in str(e).lower():
-                pass  # idempotent -- column already exists on a re-run
+            msg = str(e).lower()
+            if "duplicate column name" in msg:
+                # ALTER TABLE re-run -- column already exists, safe to ignore.
+                pass
+            elif "already exists" in msg:
+                # CREATE INDEX re-run on older SQLite without IF NOT EXISTS
+                # support -- index already present, safe to ignore.
+                pass
+            elif "no such table" in msg:
+                raise RuntimeError(
+                    f"Migration failed: target table missing for:\n  {sql!r}\n"
+                    f"SQLite error: {e}\n"
+                    "Check that init_db() completed successfully before "
+                    "_run_migrations() was called (executescript may have "
+                    "been interrupted by OOM or disk-full)."
+                ) from e
             else:
                 raise RuntimeError(
-                    f"Migration failed (non-duplicate error): {sql!r}\n{e}"
+                    f"Migration failed (unexpected error): {sql!r}\n{e}"
                 ) from e
