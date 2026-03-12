@@ -15,6 +15,28 @@ _ALLOWED_TRADE_COLS: frozenset[str] = frozenset({
     "recommendation_snap_time",
 })
 
+# ---------------------------------------------------------------------------
+# P2-5: upper-bound guard for caller-supplied row limits.
+# ---------------------------------------------------------------------------
+_LIMIT_MIN: int = 1
+_LIMIT_MAX: int = 500
+
+
+def _check_limit(value: int, name: str = "limit") -> None:
+    """Raise ValueError if *value* is outside [_LIMIT_MIN, _LIMIT_MAX].
+
+    P2-5: get_open_trades / get_pending_trades / get_trade_history all
+    interpolate the caller-supplied limit directly into an f-string SQL
+    fragment.  An unchecked large value causes a full-table scan that is
+    serialised to a list[dict] in RAM -- silent, unbounded, no error.
+    A value of 0 returns 0 rows without error, causing callers to silently
+    skip the recommendation / gate cycle.
+    """
+    if not (_LIMIT_MIN <= value <= _LIMIT_MAX):
+        raise ValueError(
+            f"{name} must be in [{_LIMIT_MIN}, {_LIMIT_MAX}], got {value!r}"
+        )
+
 
 def create_trade(conn: sqlite3.Connection, data: dict) -> int:
     """Insert a new trade row and return the new row id.
@@ -53,7 +75,11 @@ def get_open_trades(
     certainly a bug artifact (missed EOD close), not a live position.
     Filtering stale rows prevents the scheduler from issuing one DuckDB
     round-trip per stale trade per tick indefinitely.
+
+    limit: capped at _LIMIT_MAX (500) -- raises ValueError if exceeded.
+    P2-5: unchecked limit caused silent full-table scans serialised to RAM.
     """
+    _check_limit(limit)
     q      = "SELECT * FROM trades WHERE status='ACCEPTED' AND trade_date >= date('now', ?)"
     params = [f"-{max_age_days} days"]
     if underlying:
@@ -73,7 +99,11 @@ def get_pending_trades(
 
     max_age_days=1 (default): a recommendation that was never
     accepted/rejected after 1 day is expired stale data.
+
+    limit: capped at _LIMIT_MAX (500) -- raises ValueError if exceeded.
+    P2-5: unchecked limit caused silent full-table scans serialised to RAM.
     """
+    _check_limit(limit)
     q      = "SELECT * FROM trades WHERE status='GENERATED' AND trade_date >= date('now', ?)"
     params = [f"-{max_age_days} days"]
     if underlying:
@@ -101,6 +131,12 @@ def get_trade_history(
     underlying: str | None = None,
     status:     str | None = None,
 ) -> dict:
+    """Return a paginated slice of the trades table.
+
+    per_page: capped at _LIMIT_MAX (500) -- raises ValueError if exceeded.
+    P2-5: unchecked per_page caused silent full-table scans serialised to RAM.
+    """
+    _check_limit(per_page, name="per_page")
     offset = (page - 1) * per_page
     where_clauses: list[str] = []
     params:        list      = []
